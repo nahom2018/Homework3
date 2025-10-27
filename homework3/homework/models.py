@@ -2,62 +2,71 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD = [0.2064, 0.1944, 0.2252]
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, use_bn=True):
+        super().__init__()
+        layers = [nn.Conv2d(in_ch, out_ch, k, s, p, bias=not use_bn)]
+        if use_bn:
+            layers.append(nn.BatchNorm2d(out_ch))
+        layers.append(nn.ReLU(inplace=True))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class Classifier(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 3,
-        num_classes: int = 6,
-    ):
-        """
-        A convolutional network for image classification.
-
-        Args:
-            in_channels: int, number of input channels
-            num_classes: int
-        """
+    """
+    Input:  (B, 3, 64, 64)
+    Output: (B, 6) logits
+    """
+    def __init__(self, num_classes: int = 6):
         super().__init__()
+        # Feature extractor
+        self.stem = nn.Sequential(
+            ConvBlock(3, 32),
+            ConvBlock(32, 32),
+            nn.MaxPool2d(2),           # 64 -> 32
+            ConvBlock(32, 64),
+            ConvBlock(64, 64),
+            nn.MaxPool2d(2),           # 32 -> 16
+            ConvBlock(64, 128),
+            ConvBlock(128, 128),
+            nn.MaxPool2d(2),           # 16 -> 8
+        )
 
-        self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
-        self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
+        # Resolution-agnostic head
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))  # (B, C, 1, 1)
+        self.dropout = nn.Dropout(p=0.3)
+        self.fc = nn.Linear(128, num_classes)
 
-        # TODO: implement
-        pass
+        self._init_weights()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: tensor (b, 3, h, w) image
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
 
-        Returns:
-            tensor (b, num_classes) logits
-        """
-        # optional: normalizes the input
-        z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
-
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 6)
-
+    def forward(self, x):
+        x = self.stem(x)             # (B, 128, H/8, W/8)
+        x = self.gap(x)              # (B, 128, 1, 1)
+        x = torch.flatten(x, 1)      # (B, 128)
+        x = self.dropout(x)
+        logits = self.fc(x)          # (B, 6)
         return logits
-
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Used for inference, returns class labels
-        This is what the AccuracyMetric uses as input (this is what the grader will use!).
-        You should not have to modify this function.
-
-        Args:
-            x (torch.FloatTensor): image with shape (b, 3, h, w) and vals in [0, 1]
-
-        Returns:
-            pred (torch.LongTensor): class labels {0, 1, ..., 5} with shape (b, h, w)
-        """
-        return self(x).argmax(dim=1)
 
 
 class Detector(torch.nn.Module):
@@ -95,7 +104,8 @@ class Detector(torch.nn.Module):
                 - depth (b, h, w)
         """
         # optional: normalizes the input
-        z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
+        z = (x - self.input_mean[None, :, None, None]
+             ) / self.input_std[None, :, None, None]
 
         # TODO: replace with actual forward pass
         logits = torch.randn(x.size(0), 3, x.size(2), x.size(3))
@@ -156,7 +166,8 @@ def load_model(
     model_size_mb = calculate_model_size_mb(m)
 
     if model_size_mb > 20:
-        raise AssertionError(f"{model_name} is too large: {model_size_mb:.2f} MB")
+        raise AssertionError(
+            f"{model_name} is too large: {model_size_mb:.2f} MB")
 
     return m
 
