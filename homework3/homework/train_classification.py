@@ -89,21 +89,67 @@ def main():
     print(f"Using device: {device}")
 
     # === Data ===
-    if load_data is not None:
-        # Expected starter: returns train_loader, val_loader or a dict of loaders
-        loaders = load_data(
-            transform_pipeline=args.transform,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-        if isinstance(loaders, dict):
-            train_loader = loaders.get("train") or loaders.get("trn")
-            val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
-        else:
-            train_loader, val_loader = loaders
+    # === Data ===
+if load_data is not None:
+    loaders = load_data(
+        transform_pipeline=args.transform,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    if isinstance(loaders, dict):
+        train_loader = loaders.get("train") or loaders.get("trn")
+        val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     else:
-       
-        raise RuntimeError("Please wire your dataset loaders or enable the ImageFolder fallback.")
+        train_loader, val_loader = loaders
+else:
+    from torchvision import datasets, transforms
+
+    # Try to use your project transform if present; otherwise, use a simple default.
+    try:
+        from homework.datasets.classification_datasets import get_transform
+        tr_tf = get_transform(split="train", transform_pipeline=args.transform)
+        va_tf = get_transform(split="val", transform_pipeline=args.transform)
+    except Exception:
+        MEAN = (0.485, 0.456, 0.406)
+        STD  = (0.229, 0.224, 0.225)
+        tr_tf = transforms.Compose([
+            transforms.RandomResizedCrop(64, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=10),
+            transforms.ToTensor(),
+            transforms.Normalize(MEAN, STD),
+        ])
+        va_tf = transforms.Compose([
+            transforms.Resize(72),
+            transforms.CenterCrop(64),
+            transforms.ToTensor(),
+            transforms.Normalize(MEAN, STD),
+        ])
+
+    train_root = os.path.join("classification_data", "train")
+    # Auto-detect a validation folder name
+    for cand in ("val", "valid", "validation", "test"):
+        val_root = os.path.join("classification_data", cand)
+        if os.path.isdir(val_root):
+            break
+    else:
+        raise FileNotFoundError(
+            "Could not find a validation folder in classification_data/. "
+            "Expected one of: val, valid, validation, test"
+        )
+
+    train_ds = datasets.ImageFolder(train_root, transform=tr_tf)
+    val_ds   = datasets.ImageFolder(val_root,   transform=va_tf)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
+
 
     # === Model, loss, optim ===
     model = Classifier(num_classes=6).to(device)
