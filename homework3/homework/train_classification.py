@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from homework.models import Classifier
 
 try:
-    from homework.datasets.classification_datasets import load_data
+    from homework.datasets.classification_dataset import load_data, get_transform
 except Exception:
     load_data = None
 
@@ -91,7 +91,6 @@ def main():
 
    
     # === Data ===
-if load_data is not None:
     loaders = load_data(
         transform_pipeline=args.transform,
         batch_size=args.batch_size,
@@ -99,78 +98,9 @@ if load_data is not None:
     )
     if isinstance(loaders, dict):
         train_loader = loaders.get("train") or loaders.get("trn")
-        val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
+        val_loader   = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     else:
         train_loader, val_loader = loaders
-else:
-    
-
-    # Try to use your project transform if present; otherwise, use a simple default.
-    try:
-        from homework.datasets.classification_datasets import get_transform
-        tr_tf = get_transform(split="train", transform_pipeline=args.transform)
-        va_tf = get_transform(split="val", transform_pipeline=args.transform)
-    except Exception:
-        MEAN = (0.485, 0.456, 0.406)
-        STD  = (0.229, 0.224, 0.225)
-        tr_tf = transforms.Compose([
-            transforms.RandomResizedCrop(64, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
-            transforms.ToTensor(),
-            transforms.Normalize(MEAN, STD),
-        ])
-        va_tf = transforms.Compose([
-            transforms.Resize(72),
-            transforms.CenterCrop(64),
-            transforms.ToTensor(),
-            transforms.Normalize(MEAN, STD),
-        ])
-
-    def _has_class_subdirs(path):
-        if not os.path.isdir(path):
-            return False
-        for d in os.listdir(path):
-            dd = os.path.join(path, d)
-            if os.path.isdir(dd):
-                for f in os.listdir(dd):
-                    if os.path.isfile(os.path.join(dd, f)):
-                        return True
-        return False
-
-    def _find_split_dir(base, split_names=("train", "trn"), must_have_classes=True):
-        for root, dirs, files in os.walk(base):
-            for name in split_names:
-                cand = os.path.join(root, name)
-                if os.path.isdir(cand) and (not must_have_classes or _has_class_subdirs(cand)):
-                    return cand
-        return None
-
-    base = "classification_data"
-    train_root = _find_split_dir(base, ("train", "trn"), must_have_classes=True)
-    val_root   = _find_split_dir(base, ("val", "valid", "validation", "test"), must_have_classes=True)
-
-    if train_root is None or val_root is None:
-        raise FileNotFoundError(
-            f"Could not locate proper train/val folders under '{base}'. "
-            "Make sure the dataset is unzipped and contains class subfolders."
-        )
-
-    print(f"Using train_root={train_root}")
-    print(f"Using val_root  ={val_root}")
-
-    train_ds = datasets.ImageFolder(train_root, transform=tr_tf)
-    val_ds   = datasets.ImageFolder(val_root,   transform=va_tf)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
-    )
-
 
     # === Model, loss, optim ===
     model = Classifier(num_classes=6).to(device)
