@@ -127,17 +127,37 @@ else:
             transforms.Normalize(MEAN, STD),
         ])
 
-    train_root = os.path.join("classification_data", "train")
-    # Auto-detect a validation folder name
-    for cand in ("val", "valid", "validation", "test"):
-        val_root = os.path.join("classification_data", cand)
-        if os.path.isdir(val_root):
-            break
-    else:
+    def _has_class_subdirs(path):
+        if not os.path.isdir(path):
+            return False
+        for d in os.listdir(path):
+            dd = os.path.join(path, d)
+            if os.path.isdir(dd):
+                for f in os.listdir(dd):
+                    if os.path.isfile(os.path.join(dd, f)):
+                        return True
+        return False
+
+    def _find_split_dir(base, split_names=("train", "trn"), must_have_classes=True):
+        for root, dirs, files in os.walk(base):
+            for name in split_names:
+                cand = os.path.join(root, name)
+                if os.path.isdir(cand) and (not must_have_classes or _has_class_subdirs(cand)):
+                    return cand
+        return None
+
+    base = "classification_data"
+    train_root = _find_split_dir(base, ("train", "trn"), must_have_classes=True)
+    val_root   = _find_split_dir(base, ("val", "valid", "validation", "test"), must_have_classes=True)
+
+    if train_root is None or val_root is None:
         raise FileNotFoundError(
-            "Could not find a validation folder in classification_data/. "
-            "Expected one of: val, valid, validation, test"
+            f"Could not locate proper train/val folders under '{base}'. "
+            "Make sure the dataset is unzipped and contains class subfolders."
         )
+
+    print(f"Using train_root={train_root}")
+    print(f"Using val_root  ={val_root}")
 
     train_ds = datasets.ImageFolder(train_root, transform=tr_tf)
     val_ds   = datasets.ImageFolder(val_root,   transform=va_tf)
