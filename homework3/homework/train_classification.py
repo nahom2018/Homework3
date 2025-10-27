@@ -1,6 +1,7 @@
 import argparse
 import os
 from datetime import datetime
+from torchvision import datasets, transforms
 
 import torch
 import torch.nn as nn
@@ -102,7 +103,7 @@ if load_data is not None:
     else:
         train_loader, val_loader = loaders
 else:
-    from torchvision import datasets, transforms
+    
 
     # Try to use your project transform if present; otherwise, use a simple default.
     try:
