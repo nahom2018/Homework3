@@ -92,38 +92,15 @@ def main():
    
     # === Data ===
     loaders = load_data(
-        transform_pipeline=args.transform,
+        transform_pipeline=args.transform,  # use "default" or "aug"
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
     if isinstance(loaders, dict):
         train_loader = loaders.get("train") or loaders.get("trn")
-        val_loader   = loaders.get("val") or loaders.get("valid") or loaders.get("test")
+        val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     else:
         train_loader, val_loader = loaders
-
-    # === Model, loss, optim ===
-    model = Classifier(num_classes=6).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-
-    best_acc, best_path = 0.0, None
-    for epoch in range(1, args.epochs + 1):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
-        va_loss, va_acc = evaluate(model, val_loader, criterion, device)
-        scheduler.step(va_acc)
-
-        print(f"Epoch {epoch:02d} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
-
-        if va_acc > best_acc:
-            best_acc = va_acc
-            best_path = save_model(model, out_dir=args.save_dir, prefix="classifier")
-            print(f"  ↳ New best val acc: {best_acc:.4f}. Saved to {best_path}")
-
-    print(f"Best val acc: {best_acc:.4f} | Best path: {best_path}")
 
 
 if __name__ == "__main__":
