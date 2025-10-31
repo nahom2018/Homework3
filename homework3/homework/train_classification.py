@@ -80,7 +80,7 @@ def evaluate(model, loader, criterion, device):
 class STKFolderOrCSV(Dataset):
     """
     Works with either:
-      A) labels.csv in each split dir (filename,label)
+      A) labels.csv in each split dir (filename,label) where label can be int or string
       B) per-class subfolders (ImageFolder-style)
     """
     def __init__(self, root, transform=None):
@@ -88,50 +88,88 @@ class STKFolderOrCSV(Dataset):
         self.transform = transform
         csv_path = os.path.join(root, "labels.csv")
         self.samples = []
+        self.class_to_idx = None
 
         if os.path.isfile(csv_path):
-            # CSV mode
+            # --- CSV mode: supports string labels ---
+            rows = []
             with open(csv_path, "r") as f:
-                reader = csv.reader(f)
+                import csv as _csv
+                reader = _csv.reader(f)
                 header = next(reader, None)
                 for row in reader:
-                    if not row:
+                    if not row or len(row) < 2:
                         continue
-                    # Try common schemas
-                    if len(row) >= 2:
-                        fname = row[0]
-                        label = int(row[1])
-                        img_path = os.path.join(root, "images", fname)
-                        if not os.path.isfile(img_path):
-                            img_path = os.path.join(root, fname)
-                        if os.path.isfile(img_path):
-                            self.samples.append((img_path, label))
-            if len(self.samples) == 0:
+                    rows.append((row[0], row[1]))
+
+            if not rows:
                 raise FileNotFoundError(f"No image entries found via {csv_path}.")
+
+            # Build label mapping: if label looks like int, use int; else build a string->index map
+            # Collect all label tokens
+            label_tokens = [r[1] for r in rows]
+            all_intlike = False
+            try:
+                _ = [int(t) for t in label_tokens]
+                all_intlike = True
+            except Exception:
+                all_intlike = False
+
+            if all_intlike:
+                # Use provided ints directly, but still record mapping for reference
+                classes = sorted(set(int(t) for t in label_tokens))
+                self.class_to_idx = {str(c): c for c in classes}
+                def _to_idx(lbl): return int(lbl)
+            else:
+                # Map strings to indices deterministically
+                classes = sorted(set(label_tokens))
+                self.class_to_idx = {c: i for i, c in enumerate(classes)}
+                def _to_idx(lbl): return self.class_to_idx[lbl]
+
+            # Resolve image paths and build samples
+            for fname, lbl in rows:
+                img_path = os.path.join(root, "images", fname)
+                if not os.path.isfile(img_path):
+                    img_path = os.path.join(root, fname)
+                if os.path.isfile(img_path):
+                    self.samples.append((img_path, _to_idx(lbl)))
+
+            if len(self.samples) == 0:
+                raise FileNotFoundError(
+                    f"No images found for entries in {csv_path}. "
+                    "Checked both <split>/images/<filename> and <split>/<filename>."
+                )
+
+            print(f"[STKFolderOrCSV] CSV mode at '{root}': {len(self.samples)} samples, "
+                  f"{len(self.class_to_idx)} classes -> {self.class_to_idx}")
+
         else:
-            # Fallback: class-subfolders
+            # --- Fallback: class-subfolders mode ---
             classes = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
             if not classes:
                 raise FileNotFoundError(f"Couldn't find labels.csv or class folders in {root}.")
-            class_to_idx = {c: i for i, c in enumerate(classes)}
+            self.class_to_idx = {c: i for i, c in enumerate(classes)}
             exts = {".jpg", ".jpeg", ".png", ".bmp"}
             for c in classes:
                 cdir = os.path.join(root, c)
                 for fn in os.listdir(cdir):
                     if os.path.splitext(fn)[1].lower() in exts:
-                        self.samples.append((os.path.join(cdir, fn), class_to_idx[c]))
+                        self.samples.append((os.path.join(cdir, fn), self.class_to_idx[c]))
             if len(self.samples) == 0:
                 raise FileNotFoundError(f"No images found under class folders in {root}.")
+            print(f"[STKFolderOrCSV] Folder mode at '{root}': {len(self.samples)} samples, "
+                  f"{len(self.class_to_idx)} classes -> {self.class_to_idx}")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        path, label = self.samples[idx]
+        path, label_idx = self.samples[idx]
         img = Image.open(path).convert("RGB")
         if self.transform:
             img = self.transform(img)
-        return {"image": img, "label": torch.tensor(label, dtype=torch.long)}
+        return {"image": img, "label": torch.tensor(label_idx, dtype=torch.long)}
+
 
 
 def main():
