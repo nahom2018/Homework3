@@ -91,7 +91,7 @@ class DriveDataset(Dataset):
         return {"image": img, "depth": depth, "track": seg}
 
 
-def load_data(batch_size=16, num_workers=2, root="classification_data", image_size=(96,128)):
+def load_data(batch_size=16, num_workers=2, root="drive_data", image_size=(96,128)):
     train_root = os.path.join(root, "train")
     val_root   = os.path.join(root, "val")
     if not (os.path.isdir(train_root) and os.path.isdir(val_root)):
