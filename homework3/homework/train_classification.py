@@ -6,8 +6,10 @@ from torchvision import datasets, transforms
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from homework.models import Classifier
+import os, csv
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
 
 try:
     from homework.datasets.classification_dataset import load_data, get_transform
@@ -75,6 +77,63 @@ def evaluate(model, loader, criterion, device):
             n += bs
     return loss_sum / n, acc_sum / n
 
+class STKFolderOrCSV(Dataset):
+    """
+    Works with either:
+      A) labels.csv in each split dir (filename,label)
+      B) per-class subfolders (ImageFolder-style)
+    """
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        csv_path = os.path.join(root, "labels.csv")
+        self.samples = []
+
+        if os.path.isfile(csv_path):
+            # CSV mode
+            with open(csv_path, "r") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                for row in reader:
+                    if not row:
+                        continue
+                    # Try common schemas
+                    if len(row) >= 2:
+                        fname = row[0]
+                        label = int(row[1])
+                        img_path = os.path.join(root, "images", fname)
+                        if not os.path.isfile(img_path):
+                            img_path = os.path.join(root, fname)
+                        if os.path.isfile(img_path):
+                            self.samples.append((img_path, label))
+            if len(self.samples) == 0:
+                raise FileNotFoundError(f"No image entries found via {csv_path}.")
+        else:
+            # Fallback: class-subfolders
+            classes = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+            if not classes:
+                raise FileNotFoundError(f"Couldn't find labels.csv or class folders in {root}.")
+            class_to_idx = {c: i for i, c in enumerate(classes)}
+            exts = {".jpg", ".jpeg", ".png", ".bmp"}
+            for c in classes:
+                cdir = os.path.join(root, c)
+                for fn in os.listdir(cdir):
+                    if os.path.splitext(fn)[1].lower() in exts:
+                        self.samples.append((os.path.join(cdir, fn), class_to_idx[c]))
+            if len(self.samples) == 0:
+                raise FileNotFoundError(f"No images found under class folders in {root}.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return {"image": img, "label": torch.tensor(label, dtype=torch.long)}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--batch_size", type=int, default=128)
@@ -82,7 +141,7 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--transform", type=str, default="basic_aug")
+    p.add_argument("--transform", type=str, default="aug")
     p.add_argument("--save_dir", type=str, default="logs")
     args = p.parse_args()
 
@@ -91,17 +150,53 @@ def main():
 
    
     # === Data ===
-    loaders = load_data(
-        transform_pipeline=args.transform,  # use "default" or "aug"
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
-    if isinstance(loaders, dict):
-        train_loader = loaders.get("train") or loaders.get("trn")
-        val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
-    else:
-        train_loader, val_loader = loaders
+    try:
+        from homework.datasets.classification_dataset import get_transform as _get_transform
+        tr_tf = _get_transform(transform_pipeline=args.transform) if "aug" in args.transform else _get_transform(
+            "default")
+        va_tf = _get_transform("default")
+    except Exception:
+        from torchvision import transforms
+        MEAN = (0.485, 0.456, 0.406)
+        STD = (0.229, 0.224, 0.225)
+        if args.transform in ("aug", "basic_aug"):
+            tr_tf = transforms.Compose([
+                transforms.RandomResizedCrop(64, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+                transforms.ToTensor(),
+                transforms.Normalize(MEAN, STD),
+            ])
+        else:
+            tr_tf = transforms.Compose([
+                transforms.Resize(72),
+                transforms.CenterCrop(64),
+                transforms.ToTensor(),
+                transforms.Normalize(MEAN, STD),
+            ])
+        va_tf = transforms.Compose([
+            transforms.Resize(72),
+            transforms.CenterCrop(64),
+            transforms.ToTensor(),
+            transforms.Normalize(MEAN, STD),
+        ])
 
+    train_root = os.path.join("classification_data", "train")
+    val_root = os.path.join("classification_data", "val")
+    if not os.path.isdir(train_root) or not os.path.isdir(val_root):
+        raise FileNotFoundError("Expected classification_data/train and classification_data/val.")
+
+    train_ds = STKFolderOrCSV(train_root, transform=tr_tf)
+    val_ds = STKFolderOrCSV(val_root, transform=va_tf)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
     # === Model, loss, optim ===
     model = Classifier(num_classes=6).to(device)
     criterion = nn.CrossEntropyLoss()
