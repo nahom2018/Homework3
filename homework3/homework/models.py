@@ -126,52 +126,8 @@ class Detector(nn.Module):
         xd0 = self.up0(xd1, x1)       # (B,32,96,128)
 
         seg_logits = self.seg_head(xd0)
-        depth = torch.sigmoid(self.depth_head(xd0))  # depth in [0,1]
+        depth = torch.sigmoid(self.depth_head(xd0))  # depth normalized [0,1]
         return seg_logits, depth
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Used in training, takes an image and returns raw logits and raw depth.
-        This is what the loss functions use as input.
-
-        Args:
-            x (torch.FloatTensor): image with shape (b, 3, h, w) and vals in [0, 1]
-
-        Returns:
-            tuple of (torch.FloatTensor, torch.FloatTensor):
-                - logits (b, num_classes, h, w)
-                - depth (b, h, w)
-        """
-        # optional: normalizes the input
-        z = (x - self.input_mean[None, :, None, None]
-             ) / self.input_std[None, :, None, None]
-
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 3, x.size(2), x.size(3))
-        raw_depth = torch.rand(x.size(0), x.size(2), x.size(3))
-
-        return logits, raw_depth
-
-    def predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Used for inference, takes an image and returns class labels and normalized depth.
-        This is what the metrics use as input (this is what the grader will use!).
-
-        Args:
-            x (torch.FloatTensor): image with shape (b, 3, h, w) and vals in [0, 1]
-
-        Returns:
-            tuple of (torch.LongTensor, torch.FloatTensor):
-                - pred: class labels {0, 1, 2} with shape (b, h, w)
-                - depth: normalized depth [0, 1] with shape (b, h, w)
-        """
-        logits, raw_depth = self(x)
-        pred = logits.argmax(dim=1)
-
-        # Optional additional post-processing for depth only if needed
-        depth = raw_depth
-
-        return pred, depth
 
 
 MODEL_FACTORY = {
