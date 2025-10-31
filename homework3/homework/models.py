@@ -19,6 +19,19 @@ class ConvBlock(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBlock(out_ch * 2, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
 
 class Classifier(nn.Module):
     """
@@ -69,26 +82,52 @@ class Classifier(nn.Module):
         return logits
 
 
-class Detector(torch.nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 3,
-        num_classes: int = 3,
-    ):
-        """
-        A single model that performs segmentation and depth regression
+class Detector(nn.Module):
+    """
+    Input:  (B, 3, 96, 128)
+    Output:
+        seg_logits: (B, 3, 96, 128)
+        depth:      (B, 1, 96, 128)
+    """
 
-        Args:
-            in_channels: int, number of input channels
-            num_classes: int
-        """
+    def __init__(self, num_classes=3):
         super().__init__()
 
-        self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
-        self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
+        # --- Encoder ---
+        self.down1 = nn.Sequential(ConvBlock(3, 32), ConvBlock(32, 32))
+        self.down2 = nn.Sequential(ConvBlock(32, 64), ConvBlock(64, 64))
+        self.down3 = nn.Sequential(ConvBlock(64, 128), ConvBlock(128, 128))
+        self.pool = nn.MaxPool2d(2)
 
-        # TODO: implement
-        pass
+        # --- Bottleneck ---
+        self.bottleneck = nn.Sequential(ConvBlock(128, 256), ConvBlock(256, 256))
+
+        # --- Decoder ---
+        self.up2 = UpBlock(256, 128)
+        self.up1 = UpBlock(128, 64)
+        self.up0 = UpBlock(64, 32)
+
+        # --- Output heads ---
+        self.seg_head = nn.Conv2d(32, num_classes, kernel_size=1)
+        self.depth_head = nn.Conv2d(32, 1, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        x1 = self.down1(x)            # (B, 32, 96, 128)
+        x2 = self.down2(self.pool(x1))# (B, 64, 48, 64)
+        x3 = self.down3(self.pool(x2))# (B,128,24,32)
+
+        # Bottleneck
+        xb = self.bottleneck(self.pool(x3))  # (B,256,12,16)
+
+        # Decoder with skip connections
+        xd2 = self.up2(xb, x3)        # (B,128,24,32)
+        xd1 = self.up1(xd2, x2)       # (B,64,48,64)
+        xd0 = self.up0(xd1, x1)       # (B,32,96,128)
+
+        seg_logits = self.seg_head(xd0)
+        depth = torch.sigmoid(self.depth_head(xd0))  # depth in [0,1]
+        return seg_logits, depth
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """

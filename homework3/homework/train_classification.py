@@ -1,30 +1,22 @@
-import argparse
-import os
+
+import argparse, os
 from datetime import datetime
-from torchvision import datasets, transforms
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from homework.models import Classifier
-import os, csv
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+
+from homework.models import Detector
 
 try:
-    from homework.datasets.classification_dataset import load_data, get_transform
+    # Provided by the assignment for Part 2
+    from homework.datasets.drive_dataset import load_data
 except Exception:
     load_data = None
 
 
-def accuracy(logits, y):
-    with torch.no_grad():
-        preds = logits.argmax(dim=1)
-        correct = (preds == y).sum().item()
-        return correct / y.size(0)
-
-
-def save_model(model, out_dir="logs", prefix="classifier"):
+def save_model(model, out_dir="logs", prefix="detector"):
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%m%d_%H%M%S")
     path = os.path.join(out_dir, f"{prefix}_{ts}.th")
@@ -32,231 +24,142 @@ def save_model(model, out_dir="logs", prefix="classifier"):
     return path
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
+@torch.no_grad()
+def compute_mean_iou(preds, targets, num_classes=3):
+    """
+    preds: (B,H,W) int
+    targets: (B,H,W) int
+    """
+    iou_sum = 0.0
+    count = 0
+    for cls in range(num_classes):
+        pred_cls = (preds == cls)
+        tgt_cls  = (targets == cls)
+        inter = (pred_cls & tgt_cls).sum().item()
+        union = (pred_cls | tgt_cls).sum().item()
+        if union > 0:
+            iou_sum += inter / union
+            count += 1
+    return (iou_sum / count) if count > 0 else 0.0
+
+
+def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0):
     model.train()
-    running_loss, running_acc, n = 0.0, 0.0, 0
+    ce = nn.CrossEntropyLoss()
+    l1 = nn.L1Loss()
+
+    running_loss = 0.0
+    n = 0
     for batch in loader:
-        x, y = batch["image"], batch["label"] if isinstance(batch, dict) else batch
-        x, y = x.to(device), y.to(device)
+        x = batch["image"].to(device)               # (B,3,96,128)
+        y_seg = batch["track"].to(device).long()    # (B,96,128) with {0,1,2}
+        y_depth = batch["depth"].to(device).float() # (B,96,128) in [0,1]
 
         optimizer.zero_grad(set_to_none=True)
-        if scaler is not None:
-            with torch.autocast(device_type=device.type, dtype=torch.float16):
-                logits = model(x)
-                loss = criterion(logits, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
 
+        seg_logits, depth = model(x)                # seg:(B,3,H,W), depth:(B,1,H,W)
+        loss_seg = ce(seg_logits, y_seg)
+        loss_depth = l1(depth, y_depth.unsqueeze(1))
+        loss = w_seg * loss_seg + w_depth * loss_depth
 
-        bs = y.size(0)
+        loss.backward()
+        optimizer.step()
+
+        bs = x.size(0)
         running_loss += loss.item() * bs
-        running_acc += accuracy(logits, y) * bs
         n += bs
 
+    return running_loss / n
 
-    return running_loss / n, running_acc / n
 
-def evaluate(model, loader, criterion, device):
+@torch.no_grad()
+def evaluate(model, loader, device, num_classes=3):
     model.eval()
-    loss_sum, acc_sum, n = 0.0, 0.0, 0
-    with torch.inference_mode():
-        for batch in loader:
-            x, y = batch["image"], batch["label"] if isinstance(batch, dict) else batch
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits, y)
-            bs = y.size(0)
-            loss_sum += loss.item() * bs
-            acc_sum += accuracy(logits, y) * bs
-            n += bs
-    return loss_sum / n, acc_sum / n
+    l1 = nn.L1Loss(reduction="mean")
 
-class STKFolderOrCSV(Dataset):
-    """
-    Works with either:
-      A) labels.csv in each split dir (filename,label) where label can be int or string
-      B) per-class subfolders (ImageFolder-style)
-    """
-    def __init__(self, root, transform=None):
-        self.root = root
-        self.transform = transform
-        csv_path = os.path.join(root, "labels.csv")
-        self.samples = []
-        self.class_to_idx = None
+    total_iou = 0.0
+    total_mae = 0.0
+    total_lane_mae = 0.0
+    n = 0
 
-        if os.path.isfile(csv_path):
-            # --- CSV mode: supports string labels ---
-            rows = []
-            with open(csv_path, "r") as f:
-                import csv as _csv
-                reader = _csv.reader(f)
-                header = next(reader, None)
-                for row in reader:
-                    if not row or len(row) < 2:
-                        continue
-                    rows.append((row[0], row[1]))
+    for batch in loader:
+        x = batch["image"].to(device)
+        y_seg = batch["track"].to(device).long()
+        y_depth = batch["depth"].to(device).float()
 
-            if not rows:
-                raise FileNotFoundError(f"No image entries found via {csv_path}.")
+        seg_logits, depth = model(x)
+        preds = seg_logits.argmax(dim=1)  # (B,H,W)
 
-            # Build label mapping: if label looks like int, use int; else build a string->index map
-            # Collect all label tokens
-            label_tokens = [r[1] for r in rows]
-            all_intlike = False
-            try:
-                _ = [int(t) for t in label_tokens]
-                all_intlike = True
-            except Exception:
-                all_intlike = False
+        # IoU (mean over present classes)
+        miou = compute_mean_iou(preds, y_seg, num_classes=num_classes)
 
-            if all_intlike:
-                # Use provided ints directly, but still record mapping for reference
-                classes = sorted(set(int(t) for t in label_tokens))
-                self.class_to_idx = {str(c): c for c in classes}
-                def _to_idx(lbl): return int(lbl)
-            else:
-                # Map strings to indices deterministically
-                classes = sorted(set(label_tokens))
-                self.class_to_idx = {c: i for i, c in enumerate(classes)}
-                def _to_idx(lbl): return self.class_to_idx[lbl]
+        # Depth MAE (all pixels)
+        mae_all = l1(depth, y_depth.unsqueeze(1)).item()
 
-            # Resolve image paths and build samples
-            for fname, lbl in rows:
-                img_path = os.path.join(root, "images", fname)
-                if not os.path.isfile(img_path):
-                    img_path = os.path.join(root, fname)
-                if os.path.isfile(img_path):
-                    self.samples.append((img_path, _to_idx(lbl)))
-
-            if len(self.samples) == 0:
-                raise FileNotFoundError(
-                    f"No images found for entries in {csv_path}. "
-                    "Checked both <split>/images/<filename> and <split>/<filename>."
-                )
-
-            print(f"[STKFolderOrCSV] CSV mode at '{root}': {len(self.samples)} samples, "
-                  f"{len(self.class_to_idx)} classes -> {self.class_to_idx}")
-
+        # Depth MAE (lane boundary pixels only: classes 1 or 2)
+        abs_err = (depth - y_depth.unsqueeze(1)).abs()  # (B,1,H,W)
+        lane_mask = (y_seg > 0).unsqueeze(1)            # (B,1,H,W)
+        if lane_mask.any():
+            lane_mae = abs_err[lane_mask].mean().item()
         else:
-            # --- Fallback: class-subfolders mode ---
-            classes = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
-            if not classes:
-                raise FileNotFoundError(f"Couldn't find labels.csv or class folders in {root}.")
-            self.class_to_idx = {c: i for i, c in enumerate(classes)}
-            exts = {".jpg", ".jpeg", ".png", ".bmp"}
-            for c in classes:
-                cdir = os.path.join(root, c)
-                for fn in os.listdir(cdir):
-                    if os.path.splitext(fn)[1].lower() in exts:
-                        self.samples.append((os.path.join(cdir, fn), self.class_to_idx[c]))
-            if len(self.samples) == 0:
-                raise FileNotFoundError(f"No images found under class folders in {root}.")
-            print(f"[STKFolderOrCSV] Folder mode at '{root}': {len(self.samples)} samples, "
-                  f"{len(self.class_to_idx)} classes -> {self.class_to_idx}")
+            lane_mae = 0.0
 
-    def __len__(self):
-        return len(self.samples)
+        bs = x.size(0)
+        total_iou += miou * bs
+        total_mae += mae_all * bs
+        total_lane_mae += lane_mae * bs
+        n += bs
 
-    def __getitem__(self, idx):
-        path, label_idx = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return {"image": img, "label": torch.tensor(label_idx, dtype=torch.long)}
-
+    return total_iou / n, total_mae / n, total_lane_mae / n
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--transform", type=str, default="aug")
+    p.add_argument("--w_seg", type=float, default=1.0)
+    p.add_argument("--w_depth", type=float, default=1.0)
     p.add_argument("--save_dir", type=str, default="logs")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-   
-    # === Data ===
-    try:
-        from homework.datasets.classification_dataset import get_transform as _get_transform
-        tr_tf = _get_transform(transform_pipeline=args.transform) if "aug" in args.transform else _get_transform(
-            "default")
-        va_tf = _get_transform("default")
-    except Exception:
-        from torchvision import transforms
-        MEAN = (0.485, 0.456, 0.406)
-        STD = (0.229, 0.224, 0.225)
-        if args.transform in ("aug", "basic_aug"):
-            tr_tf = transforms.Compose([
-                transforms.RandomResizedCrop(64, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=10),
-                transforms.ToTensor(),
-                transforms.Normalize(MEAN, STD),
-            ])
-        else:
-            tr_tf = transforms.Compose([
-                transforms.Resize(72),
-                transforms.CenterCrop(64),
-                transforms.ToTensor(),
-                transforms.Normalize(MEAN, STD),
-            ])
-        va_tf = transforms.Compose([
-            transforms.Resize(72),
-            transforms.CenterCrop(64),
-            transforms.ToTensor(),
-            transforms.Normalize(MEAN, STD),
-        ])
+    if load_data is None:
+        raise RuntimeError("Could not import load_data from homework.datasets.drive_dataset")
 
-    train_root = os.path.join("classification_data", "train")
-    val_root = os.path.join("classification_data", "val")
-    if not os.path.isdir(train_root) or not os.path.isdir(val_root):
-        raise FileNotFoundError("Expected classification_data/train and classification_data/val.")
+    # Expecting load_data() to return dict with 'train' and 'val' DataLoaders.
+    loaders = load_data(batch_size=args.batch_size, num_workers=args.num_workers)
+    train_loader = loaders.get("train") or loaders.get("trn")
+    val_loader   = loaders.get("val") or loaders.get("valid") or loaders.get("test")
+    if train_loader is None or val_loader is None:
+        raise RuntimeError("drive_dataset.load_data() did not return expected loaders for train/val")
 
-    train_ds = STKFolderOrCSV(train_root, transform=tr_tf)
-    val_ds = STKFolderOrCSV(val_root, transform=va_tf)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
-    )
-    # === Model, loss, optim ===
-    model = Classifier(num_classes=6).to(device)
-    criterion = nn.CrossEntropyLoss()
+    model = Detector().to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-
-    best_acc, best_path = 0.0, None
+    best_iou, best_path = 0.0, None
     for epoch in range(1, args.epochs + 1):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
-        va_loss, va_acc = evaluate(model, val_loader, criterion, device)
-        scheduler.step(va_acc)
+        tr_loss = train_one_epoch(model, train_loader, optimizer, device, w_seg=args.w_seg, w_depth=args.w_depth)
+        val_iou, val_mae, val_lane_mae = evaluate(model, val_loader, device)
 
-        print(f"Epoch {epoch:02d} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {va_loss:.4f} acc {va_acc:.4f}")
+        print(
+            f"Epoch {epoch:02d} | train loss {tr_loss:.4f} | "
+            f"val IoU {val_iou:.4f} | MAE {val_mae:.4f} | lane MAE {val_lane_mae:.4f}"
+        )
 
-        if va_acc > best_acc:
-            best_acc = va_acc
-            best_path = save_model(model, out_dir=args.save_dir, prefix="classifier")
-            print(f"  ↳ New best val acc: {best_acc:.4f}. Saved to {best_path}")
+        scheduler.step(val_iou)
 
-    print(f"Best val acc: {best_acc:.4f} | Best path: {best_path}")
+        if val_iou > best_iou:
+            best_iou = val_iou
+            best_path = save_model(model, out_dir=args.save_dir, prefix="detector")
+            print(f"  ↳ New best IoU: {best_iou:.4f}. Saved to {best_path}")
+
+    print(f"Best IoU {best_iou:.4f} | Best path {best_path}")
 
 
 if __name__ == "__main__":
