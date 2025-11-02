@@ -73,6 +73,7 @@ class Classifier(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.zeros_(m.bias)
 
+
     def forward(self, x):
         x = self.stem(x)             # (B, 128, H/8, W/8)
         x = self.gap(x)              # (B, 128, 1, 1)
