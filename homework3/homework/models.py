@@ -81,6 +81,11 @@ class Classifier(nn.Module):
         logits = self.fc(x)          # (B, 6)
         return logits
 
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """Wrapper for grader compatibility"""
+        self.eval()
+        with torch.no_grad():
+            return self.forward(x)
 
 class Detector(nn.Module):
     """
@@ -128,6 +133,12 @@ class Detector(nn.Module):
         seg_logits = self.seg_head(xd0)
         depth = torch.sigmoid(self.depth_head(xd0))  # depth normalized [0,1]
         return seg_logits, depth
+
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """Wrapper for grader compatibility"""
+        self.eval()
+        with torch.no_grad():
+            return self.forward(x)
 
 
 MODEL_FACTORY = {
