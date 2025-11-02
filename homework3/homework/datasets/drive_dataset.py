@@ -12,7 +12,7 @@ class DriveDataset(Dataset):
     Reads scenes like:
       drive_data/train/cornfield_crossing_00/00000_im.jpg
       drive_data/train/cornfield_crossing_00/00000_depth.png
-      and optionally *_track.png or *_seg.png if available
+      and *_track.png / *_seg.png if available
     """
 
     def __init__(self, root, image_size=(96, 128)):
@@ -33,7 +33,7 @@ class DriveDataset(Dataset):
                 trackf = stem + "_track.png"
                 if not os.path.isfile(depthf):
                     continue
-                # If no track file, set to None (some datasets omit it)
+                # keep trackf as-is; if missing we'll resolve alternatives in __getitem__
                 if not os.path.isfile(trackf):
                     trackf = None
                 self.samples.append((imf, depthf, trackf))
@@ -69,14 +69,28 @@ class DriveDataset(Dataset):
         depth = self.depth_tf(Image.fromarray((depth * 255).astype(np.uint8)))
         depth = torch.tensor(np.array(depth), dtype=torch.float32) / 255.0
 
-        # Load segmentation if available
-        if trackf and os.path.isfile(trackf):
-            seg = Image.open(trackf).convert("L")
-            seg = self.seg_tf(seg)
-            seg = torch.tensor(np.array(seg), dtype=torch.long)
-        else:
-            # fallback: background only (class 0)
-            seg = torch.zeros_like(depth, dtype=torch.long).squeeze(0)
+        # --- Require a real segmentation mask file ---
+        if not (trackf and os.path.isfile(trackf)):
+            stem = imf.replace("_im.jpg", "")
+            candidates = [
+                stem + "_track.png",
+                stem + "_seg.png",
+                stem + "_mask.png",
+                stem + "_labels.png",
+                stem + "_lane.png",
+                stem + "_lane_mask.png",
+            ]
+            trackf = next((p for p in candidates if os.path.isfile(p)), None)
+
+        if not (trackf and os.path.isfile(trackf)):
+            raise FileNotFoundError(
+                f"Missing segmentation mask for {imf} "
+                f"(tried *_track.png, *_seg.png, *_mask.png, *_labels.png, *_lane*.png)"
+            )
+
+        seg = Image.open(trackf).convert("L")
+        seg = self.seg_tf(seg)
+        seg = torch.tensor(np.array(seg), dtype=torch.long)
 
         return {"image": img, "depth": depth, "track": seg}
 
