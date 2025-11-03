@@ -142,6 +142,7 @@ class Detector(nn.Module):
             return self.forward(x)
 
 
+
 MODEL_FACTORY = {
     "classifier": Classifier,
     "detector": Detector,
