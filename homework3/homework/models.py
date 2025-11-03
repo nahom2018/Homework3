@@ -138,11 +138,10 @@ class Detector(nn.Module):
         return seg_logits, depth
 
     def predict(self, x: torch.Tensor):
+        """Return segmentation logits and depth (for grader)."""
         self.eval()
         with torch.no_grad():
-            seg_logits, depth = self.forward(x)
-            seg_pred = seg_logits.argmax(dim=1)
-            return seg_pred, depth
+            return self.forward(x)
 
 
 
@@ -165,9 +164,11 @@ def load_model(
     if with_weights:
         model_path = HOMEWORK_DIR / f"{model_name}.th"
         assert model_path.exists(), f"{model_path.name} not found"
-
         try:
-            m.load_state_dict(torch.load(model_path, map_location="cpu"))
+            ckpt = torch.load(model_path, map_location="cpu")
+            if isinstance(ckpt, dict) and "model_state" in ckpt:
+                ckpt = ckpt["model_state"]
+            m.load_state_dict(ckpt)
         except RuntimeError as e:
             raise AssertionError(
                 f"Failed to load {model_path.name}, make sure the default model arguments are set correctly"
