@@ -187,6 +187,9 @@ def main():
             print(f"  ↳ New best IoU: {best_iou:.4f}. Saved to {best_path}")
 
     best_str = "N/A" if math.isnan(best_iou) or best_iou == -float("inf") else f"{best_iou:.4f}"
+    if best_path is None:
+        best_path = save_model(model, out_dir=args.save_dir, prefix="detector_final")
+        print(f"Saved final detector checkpoint to {best_path}")
     print(f"Best IoU {best_str} | Best path {best_path}")
 
 
