@@ -34,10 +34,6 @@ class UpBlock(nn.Module):
 
 
 class Classifier(nn.Module):
-    """
-    Input:  (B, 3, 64, 64)
-    Output: (B, 6) logits
-    """
     def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
         super().__init__()
         # Feature extractor
@@ -94,33 +90,26 @@ class Classifier(nn.Module):
             return preds
 
 class Detector(nn.Module):
-    """
-    Input:  (B, 3, 96, 128)
-    Output:
-        seg_logits: (B, 3, 96, 128)
-        depth:      (B, 1, 96, 128)
-    """
-
-    def __init__(self, num_classes=3):
+    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
         super().__init__()
+        # Feature extractor
+        self.stem = nn.Sequential(
+            ConvBlock(in_channels, 32),   # <-- use in_channels here
+            ConvBlock(32, 32),
+            nn.MaxPool2d(2),              # 64 -> 32
+            ConvBlock(32, 64),
+            ConvBlock(64, 64),
+            nn.MaxPool2d(2),              # 32 -> 16
+            ConvBlock(64, 128),
+            ConvBlock(128, 128),
+            nn.MaxPool2d(2),              # 16 -> 8
+        )
 
-        # --- Encoder ---
-        self.down1 = nn.Sequential(ConvBlock(3, 32), ConvBlock(32, 32))
-        self.down2 = nn.Sequential(ConvBlock(32, 64), ConvBlock(64, 64))
-        self.down3 = nn.Sequential(ConvBlock(64, 128), ConvBlock(128, 128))
-        self.pool = nn.MaxPool2d(2)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(p=0.3)
+        self.fc = nn.Linear(128, num_classes)
 
-        # --- Bottleneck ---
-        self.bottleneck = nn.Sequential(ConvBlock(128, 256), ConvBlock(256, 256))
-
-        # --- Decoder ---
-        self.up2 = UpBlock(256, 128)
-        self.up1 = UpBlock(128, 64)
-        self.up0 = UpBlock(64, 32)
-
-        # --- Output heads ---
-        self.seg_head = nn.Conv2d(32, num_classes, kernel_size=1)
-        self.depth_head = nn.Conv2d(32, 1, kernel_size=1)
+        self._init_weights()
 
     def forward(self, x):
         # Encoder
