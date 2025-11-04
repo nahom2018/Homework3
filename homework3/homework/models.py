@@ -34,6 +34,7 @@ class UpBlock(nn.Module):
 
 
 class Classifier(nn.Module):
+
     def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
         super().__init__()
         # Feature extractor
