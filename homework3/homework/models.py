@@ -57,6 +57,8 @@ class Classifier(nn.Module):
         self.gap = nn.AdaptiveAvgPool2d((1, 1))  # (B, C, 1, 1)
         self.dropout = nn.Dropout(p=0.3)
         self.fc = nn.Linear(128, num_classes)
+        self.register_buffer("input_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("input_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self._init_weights()
 
@@ -73,13 +75,17 @@ class Classifier(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.zeros_(m.bias)
 
-
     def forward(self, x):
-        x = self.stem(x)             # (B, 128, H/8, W/8)
-        x = self.gap(x)              # (B, 128, 1, 1)
-        x = torch.flatten(x, 1)      # (B, 128)
+        x_min, x_max = x.amin(dim=(1, 2, 3), keepdim=True), x.amax(dim=(1, 2, 3), keepdim=True)
+        x_mean = x.mean()
+        if (x_min >= 0).all() and (x_max <= 1).all() and 0.2 < float(x_mean) < 0.8:
+            x = (x - self.input_mean) / self.input_std
+
+        x = self.stem(x)
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
         x = self.dropout(x)
-        logits = self.fc(x)          # (B, 6)
+        logits = self.fc(x)
         return logits
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
