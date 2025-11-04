@@ -138,10 +138,11 @@ class Detector(nn.Module):
         return seg_logits, depth
 
     def predict(self, x: torch.Tensor):
-        """Return segmentation logits and depth (for grader)."""
         self.eval()
         with torch.no_grad():
-            return self.forward(x)
+            seg_logits, depth = self.forward(x)  # (B,3,H,W), (B,1,H,W)
+            seg_pred = seg_logits.argmax(dim=1)  # (B,H,W)
+            return seg_pred, depth
 
 
 
