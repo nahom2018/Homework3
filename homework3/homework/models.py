@@ -38,27 +38,24 @@ class Classifier(nn.Module):
     Input:  (B, 3, 64, 64)
     Output: (B, 6) logits
     """
-    def __init__(self, num_classes: int = 6):
+    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
         super().__init__()
         # Feature extractor
         self.stem = nn.Sequential(
-            ConvBlock(3, 32),
+            ConvBlock(in_channels, 32),   # <-- use in_channels here
             ConvBlock(32, 32),
-            nn.MaxPool2d(2),           # 64 -> 32
+            nn.MaxPool2d(2),              # 64 -> 32
             ConvBlock(32, 64),
             ConvBlock(64, 64),
-            nn.MaxPool2d(2),           # 32 -> 16
+            nn.MaxPool2d(2),              # 32 -> 16
             ConvBlock(64, 128),
             ConvBlock(128, 128),
-            nn.MaxPool2d(2),           # 16 -> 8
+            nn.MaxPool2d(2),              # 16 -> 8
         )
 
-        # Resolution-agnostic head
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))  # (B, C, 1, 1)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(p=0.3)
         self.fc = nn.Linear(128, num_classes)
-        self.register_buffer("input_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("input_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self._init_weights()
 
