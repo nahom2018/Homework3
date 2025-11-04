@@ -227,7 +227,7 @@ def debug_model(batch_size: int = 1):
 
     print(f"Input shape: {sample_batch.shape}")
 
-    model = load_model("classifier", in_channels=3, num_classes=6).to(device)
+    model = load_model("classifier", num_classes=6).to(device)
     output = model(sample_batch)
 
     # should output logits (b, num_classes)
