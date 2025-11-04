@@ -37,6 +37,8 @@ class Classifier(nn.Module):
 
     def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):  # <-- add in_channels, **kwargs
         super().__init__()
+        self.register_buffer("input_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("input_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         self.stem = nn.Sequential(
             ConvBlock(in_channels, 32),   # <-- use in_channels here (was 3)
             ConvBlock(32, 32),
@@ -67,10 +69,6 @@ class Classifier(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x_min, x_max = x.amin(dim=(1, 2, 3), keepdim=True), x.amax(dim=(1, 2, 3), keepdim=True)
-        x_mean = x.mean()
-        if (x_min >= 0).all() and (x_max <= 1).all() and 0.2 < float(x_mean) < 0.8:
-            x = (x - self.input_mean) / self.input_std
 
         x = self.stem(x)
         x = self.gap(x)
@@ -88,24 +86,37 @@ class Classifier(nn.Module):
             return preds
 
 class Detector(nn.Module):
-    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):  # <-- add in_channels, **kwargs
+    def __init__(self, num_classes: int = 3, in_channels: int = 3, **kwargs):
         super().__init__()
-        self.stem = nn.Sequential(
-            ConvBlock(in_channels, 32),   # <-- use in_channels here (was 3)
-            ConvBlock(32, 32),
-            nn.MaxPool2d(2),
-            ConvBlock(32, 64),
-            ConvBlock(64, 64),
-            nn.MaxPool2d(2),
-            ConvBlock(64, 128),
-            ConvBlock(128, 128),
-            nn.MaxPool2d(2),
-        )
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(p=0.3)
-        self.fc = nn.Linear(128, num_classes)
-        self._init_weights()
 
+        self.down1 = nn.Sequential(ConvBlock(in_channels, 32), ConvBlock(32, 32))
+        self.down2 = nn.Sequential(ConvBlock(32, 64), ConvBlock(64, 64))
+        self.down3 = nn.Sequential(ConvBlock(64, 128), ConvBlock(128, 128))
+        self.pool = nn.MaxPool2d(2)
+
+        self.bottleneck = nn.Sequential(ConvBlock(128, 256), ConvBlock(256, 256))
+
+        self.up2 = UpBlock(256, 128)
+        self.up1 = UpBlock(128, 64)
+        self.up0 = UpBlock(64, 32)
+
+        self.seg_head = nn.Conv2d(32, num_classes, kernel_size=1)
+        self.depth_head = nn.Conv2d(32, 1, kernel_size=1)
+
+        self._init_weights()  # now exists
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
     def forward(self, x):
         # Encoder
         x1 = self.down1(x)            # (B, 32, 96, 128)
