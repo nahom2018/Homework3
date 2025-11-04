@@ -35,25 +35,22 @@ class UpBlock(nn.Module):
 
 class Classifier(nn.Module):
 
-    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
+    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):  # <-- add in_channels, **kwargs
         super().__init__()
-        # Feature extractor
         self.stem = nn.Sequential(
-            ConvBlock(in_channels, 32),   # <-- use in_channels here
+            ConvBlock(in_channels, 32),   # <-- use in_channels here (was 3)
             ConvBlock(32, 32),
-            nn.MaxPool2d(2),              # 64 -> 32
+            nn.MaxPool2d(2),
             ConvBlock(32, 64),
             ConvBlock(64, 64),
-            nn.MaxPool2d(2),              # 32 -> 16
+            nn.MaxPool2d(2),
             ConvBlock(64, 128),
             ConvBlock(128, 128),
-            nn.MaxPool2d(2),              # 16 -> 8
+            nn.MaxPool2d(2),
         )
-
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(p=0.3)
         self.fc = nn.Linear(128, num_classes)
-
         self._init_weights()
 
     def _init_weights(self):
@@ -91,25 +88,22 @@ class Classifier(nn.Module):
             return preds
 
 class Detector(nn.Module):
-    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
+    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):  # <-- add in_channels, **kwargs
         super().__init__()
-        # Feature extractor
         self.stem = nn.Sequential(
-            ConvBlock(in_channels, 32),   # <-- use in_channels here
+            ConvBlock(in_channels, 32),   # <-- use in_channels here (was 3)
             ConvBlock(32, 32),
-            nn.MaxPool2d(2),              # 64 -> 32
+            nn.MaxPool2d(2),
             ConvBlock(32, 64),
             ConvBlock(64, 64),
-            nn.MaxPool2d(2),              # 32 -> 16
+            nn.MaxPool2d(2),
             ConvBlock(64, 128),
             ConvBlock(128, 128),
-            nn.MaxPool2d(2),              # 16 -> 8
+            nn.MaxPool2d(2),
         )
-
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(p=0.3)
         self.fc = nn.Linear(128, num_classes)
-
         self._init_weights()
 
     def forward(self, x):
