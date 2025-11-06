@@ -139,8 +139,9 @@ class Detector(nn.Module):
         self.eval()
         with torch.no_grad():
             seg_logits, depth = self.forward(x)  # (B,3,H,W), (B,1,H,W)
-            seg_pred = seg_logits.argmax(dim=1)  # (B,H,W)
-            return seg_pred, depth
+            seg_pred = seg_logits.argmax(dim=1)  # (B,H,W), long
+            depth = depth.squeeze(1)  # (B,H,W), float in [0,1]
+            return seg_pred.long(), depth.float()
 
 
 
