@@ -37,8 +37,8 @@ class Classifier(nn.Module):
 
     def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):  # <-- add in_channels, **kwargs
         super().__init__()
-        self.register_buffer("input_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("input_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.register_buffer("input_mean", torch.tensor(INPUT_MEAN).view(1, 3, 1, 1))
+        self.register_buffer("input_std", torch.tensor(INPUT_STD).view(1, 3, 1, 1))
         self.stem = nn.Sequential(
             ConvBlock(in_channels, 32),   # <-- use in_channels here (was 3)
             ConvBlock(32, 32),
@@ -70,6 +70,7 @@ class Classifier(nn.Module):
 
     def forward(self, x):
 
+        x = (x - self.input_mean) / self.input_std
         x = self.stem(x)
         x = self.gap(x)
         x = torch.flatten(x, 1)
