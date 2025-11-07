@@ -1,259 +1,255 @@
-# homework/datasets/drive_dataset.py
-import os
-from pathlib import Path
-from typing import Optional, Tuple, List
+# homework/train_detection.py
+import argparse, os, math
+from datetime import datetime
 
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-import torchvision.transforms.functional as TF
-from torchvision.transforms import InterpolationMode
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader  # noqa: F401
 
-# Common directory names and keywords we’ll search for
-MASK_DIRS = ["track", "tracks", "seg", "segs", "masks", "labels", "lane", "annotation", "annotations"]
-DEPTH_DIRS = ["depth", "depths"]
-MASK_KEYWORDS = ["track", "seg", "mask", "label", "lane", "annot"]
-DEPTH_KEYWORDS = ["depth"]
-IMG_EXTS = {".jpg", ".jpeg", ".png"}
-MASK_EXTS = {".png", ".jpg", ".jpeg", ".npy"}
-DEPTH_EXTS = {".png", ".jpg", ".jpeg"}
+from homework.models import Detector, save_model as save_for_grader
 
-DRIVE_DEBUG = os.environ.get("DRIVE_DEBUG", "0") == "1"
+# --- Use the CORRECT dataset loader (README typo) ---
+# Prefer datasets/road_dataset.py; keep fallbacks just in case.
+load_road_data = None
+try:
+    from homework.datasets.road_dataset import load_data as load_road_data
+except Exception:
+    try:
+        from homework.road_dataset import load_data as load_road_data
+    except Exception:
+        load_road_data = None
 
-# ---------- Helpers ----------
 
-def _strip_known_suffixes(stem: str) -> str:
-    """Remove common trailing tokens used in image filenames (e.g., *_im, *_rgb, *_image)."""
-    for suf in ["_im", "_rgb", "_image"]:
-        if stem.endswith(suf):
-            return stem[: -len(suf)]
-    return stem
+def save_checkpoint(model, out_dir="logs", prefix="detector"):
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"{prefix}_{ts}.th")
+    torch.save({"model_state": model.state_dict()}, path)
+    return path
 
-def _base_id_from_image_path(img_path: Path) -> str:
-    """Derive a base id usable to find matching mask/depth."""
-    stem = img_path.stem  # filename without extension
-    return _strip_known_suffixes(stem)
 
-def _first_existing(cands: List[Path]) -> Optional[Path]:
-    for p in cands:
-        if p.exists():
-            return p
+@torch.no_grad()
+def compute_mean_iou(preds, targets, num_classes=3):
+    """
+    preds:   (B,H,W) int
+    targets: (B,H,W) int
+    """
+    iou_sum, count = 0.0, 0
+    for cls in range(num_classes):
+        pred_cls = (preds == cls)
+        tgt_cls = (targets == cls)
+        inter = (pred_cls & tgt_cls).sum().item()
+        union = (pred_cls | tgt_cls).sum().item()
+        if union > 0:
+            iou_sum += inter / union
+            count += 1
+    return (iou_sum / count) if count > 0 else float("nan")
+
+
+# ---------- Batch helpers (tolerate different key names) ----------
+def get_seg(batch):
+    # common names: "track", "seg", "mask", "labels"
+    for k in ("track", "seg", "mask", "labels"):
+        if k in batch:
+            return batch[k]
     return None
 
-def _find_files_with_keywords(root: Path, base: str, dirs: List[str], keywords: List[str], exts: set) -> List[Path]:
-    """Search in root and provided subdirs for files whose name contains any keyword and base id."""
-    cands: List[Path] = []
+def get_depth(batch):
+    # common names: "depth", "depths"
+    for k in ("depth", "depths"):
+        if k in batch:
+            return batch[k]
+    return None
+# ------------------------------------------------------------------
 
-    # same-folder candidates
-    for kw in keywords + [""]:
-        for ext in exts:
-            cands.append(root / f"{base}_{kw}{ext}" if kw else root / f"{base}{ext}")
 
-    # subfolder candidates
-    for sd in dirs:
-        for kw in keywords + [""]:
-            for ext in exts:
-                cands.append(root / sd / f"{base}_{kw}{ext}" if kw else root / sd / f"{base}{ext}")
+def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, have_masks=True):
+    model.train()
+    ce = nn.CrossEntropyLoss()
+    l1 = nn.L1Loss()
 
-    # de-duplicate while preserving order
-    seen = set()
-    uniq = []
-    for p in cands:
-        if p not in seen:
-            uniq.append(p)
-            seen.add(p)
-    return [p for p in uniq if p.exists()]
+    running_loss, n = 0.0, 0
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)          # (B,3,H,W)
+        y_seg = get_seg(batch)
+        y_depth = get_depth(batch).to(device, non_blocking=True).float()  # (B,H,W)
 
-def _find_mask_and_depth(img_path: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    """
-    Try to find matching mask/depth files near an image using many filename patterns and folders.
-    Returns (mask_path or None, depth_path or None).
-    """
-    base = _base_id_from_image_path(img_path)
-    root = img_path.parent
+        optimizer.zero_grad(set_to_none=True)
+        seg_logits, depth = model(x)                              # seg:(B,3,H,W), depth:(B,1,H,W)
 
-    # Gather candidates
-    mask_cands = _find_files_with_keywords(root, base, MASK_DIRS, MASK_KEYWORDS, MASK_EXTS)
-    depth_cands = _find_files_with_keywords(root, base, DEPTH_DIRS, DEPTH_KEYWORDS, DEPTH_EXTS)
+        # Depth loss (required)
+        loss_depth = l1(depth, y_depth.unsqueeze(1)) * w_depth
 
-    # Filter out obvious mis-matches
-    mask_cands = [p for p in mask_cands if "depth" not in p.name.lower()]
-    depth_cands = [p for p in depth_cands if any(k in p.name.lower() for k in DEPTH_KEYWORDS)]
-
-    # Heuristic fallbacks
-    if not mask_cands:
-        for ext in MASK_EXTS:
-            p = root / f"{base}{ext}"
-            if p.exists() and "depth" not in p.name.lower():
-                mask_cands.append(p)
-                break
-        if not mask_cands:
-            for sd in MASK_DIRS:
-                for ext in MASK_EXTS:
-                    p = root / sd / f"{base}{ext}"
-                    if p.exists() and "depth" not in p.name.lower():
-                        mask_cands.append(p)
-                        break
-                if mask_cands:
-                    break
-
-    if not depth_cands:
-        for ext in DEPTH_EXTS:
-            p = root / f"{base}_depth{ext}"
-            if p.exists():
-                depth_cands.append(p)
-                break
-        if not depth_cands:
-            for sd in DEPTH_DIRS:
-                for ext in DEPTH_EXTS:
-                    p = root / sd / f"{base}_depth{ext}"
-                    if p.exists():
-                        depth_cands.append(p)
-                        break
-                if depth_cands:
-                    break
-        if not depth_cands:
-            for ext in DEPTH_EXTS:
-                p = root / f"{base}{ext}"
-                if p.exists() and "depth" in p.name.lower():
-                    depth_cands.append(p)
-                    break
-
-    mask_path = mask_cands[0] if mask_cands else None
-    depth_path = depth_cands[0] if depth_cands else None
-
-    if DRIVE_DEBUG and (mask_path is None or depth_path is None):
-        print(f"[DEBUG] For image {img_path}: mask={mask_path}, depth={depth_path}")
-
-    return mask_path, depth_path
-
-# ---------- Dataset ----------
-
-class DriveDataset(Dataset):
-    """
-    Expects episodes like:
-      drive_data/train/<episode>/<image files>
-    Matching mask/depth files may be in the same folder or common subfolders.
-
-    If require_masks=True, samples without masks are skipped.
-    """
-
-    def __init__(self, root, image_size=(96, 128), require_masks=True):
-        self.root = Path(root)
-        self.image_size = image_size
-        self.require_masks = require_masks
-        self.samples: List[dict] = []
-
-        if not self.root.is_dir():
-            raise FileNotFoundError(f"Root not found: {root}")
-
-        # Prefer *_im.(jpg|png) but also accept any (jpg|png)
-        im_paths = sorted(list(self.root.glob("*/*_im.jpg"))) + \
-                   sorted(list(self.root.glob("*/*_im.png")))
-        if not im_paths:
-            im_paths = sorted(list(self.root.glob("*/*.jpg"))) + \
-                       sorted(list(self.root.glob("*/*.png")))
-        if not im_paths:
-            raise FileNotFoundError(f"No image files found under {root}")
-
-        n_total = len(im_paths)
-        n_with_mask = 0
-        n_with_depth = 0
-
-        for imf in im_paths:
-            maskf, depthf = _find_mask_and_depth(imf)
-
-            if depthf is not None:
-                n_with_depth += 1
-            if maskf is not None:
-                n_with_mask += 1
-
-            # Depth required → skip if missing
-            if depthf is None:
-                continue
-            # If masks are required, skip when missing
-            if self.require_masks and (maskf is None):
-                continue
-
-            self.samples.append({"img": imf, "mask": maskf, "depth": depthf})
-
-        if not self.samples:
-            raise FileNotFoundError(
-                f"No samples with masks found under {root}. "
-                f"Ensure mask files exist (e.g., *_track.png or in track/)."
-            )
-
-        print(f"[DriveDataset] Scanned {n_total} images | depth available for {n_with_depth} | masks for {n_with_mask} (require_masks={self.require_masks})")
-        print(f"[DriveDataset] Loaded {len(self.samples)} samples from {root}")
-
-        if DRIVE_DEBUG:
-            for rec in self.samples[:5]:
-                print(f"[DEBUG] img={rec['img']} | mask={rec['mask']} | depth={rec['depth']}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        rec = self.samples[idx]
-
-        # --- Image: float [0,1] ---
-        img = Image.open(rec["img"]).convert("RGB")
-        img = TF.to_tensor(img)
-        if self.image_size is not None:
-            img = TF.resize(img, size=[self.image_size[0], self.image_size[1]],
-                            interpolation=InterpolationMode.BILINEAR)
-
-        # --- Depth: float [0,1] ---
-        dpath = rec["depth"]
-        dimg = Image.open(dpath).convert("L")
-        d = TF.to_tensor(dimg)  # 1xH xW in [0,1]
-        if self.image_size is not None:
-            d = TF.resize(d, size=[self.image_size[0], self.image_size[1]],
-                          interpolation=InterpolationMode.BILINEAR)
-        depth = d.squeeze(0)  # HxW
-
-        # --- Mask: integer labels (0/1/2), resize NEAREST ---
-        mpath = rec["mask"]
-        mask = None
-        if mpath is not None:
-            if mpath.suffix.lower() == ".npy":
-                m = np.load(mpath)
-                if m.ndim == 3:
-                    m = m[..., 0]
-                m = m.astype(np.uint8)
-            else:
-                mimg = Image.open(mpath).convert("L")
-                m = np.array(mimg, dtype=np.uint8)
-            mask = torch.from_numpy(m).long()
-            if self.image_size is not None:
-                mask = mask.unsqueeze(0).float()
-                mask = TF.resize(mask, size=[self.image_size[0], self.image_size[1]],
-                                 interpolation=InterpolationMode.NEAREST)
-                mask = mask.squeeze(0).to(dtype=torch.long)
-
-        out = {"image": img, "depth": depth}
-        if mask is not None:
-            out["track"] = mask
+        # Seg loss only if masks exist and weight > 0
+        if have_masks and (y_seg is not None) and w_seg > 0.0:
+            y_seg = y_seg.to(device, non_blocking=True).long()
+            loss_seg = ce(seg_logits, y_seg) * w_seg
         else:
-            H, W = depth.shape
-            out["track"] = torch.zeros((H, W), dtype=torch.long)
+            loss_seg = torch.zeros((), device=device)
 
-        return out
+        loss = loss_seg + loss_depth
+        loss.backward()
+        optimizer.step()
 
-def load_data(batch_size=16, num_workers=2, root="drive_data",
-              image_size=(96, 128), require_masks=True):
-    train_root = Path(root) / "train"
-    val_root = Path(root) / "val"
-    if not train_root.is_dir() or not val_root.is_dir():
-        raise FileNotFoundError(f"Expected {root}/train and {root}/val")
+        bs = x.size(0)
+        running_loss += loss.item() * bs
+        n += bs
 
-    train_ds = DriveDataset(train_root, image_size=image_size, require_masks=require_masks)
-    val_ds = DriveDataset(val_root, image_size=image_size, require_masks=require_masks)
+    return running_loss / n
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
 
-    return {"train": train_loader, "val": val_loader}
+@torch.no_grad()
+def evaluate(model, loader, device, num_classes=3, have_masks=True):
+    model.eval()
+    l1 = nn.L1Loss(reduction="mean")
+
+    total_iou = 0.0
+    total_mae = 0.0
+    total_lane_mae = 0.0
+    n = 0
+
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)
+        y_seg = get_seg(batch)
+        y_depth = get_depth(batch).to(device, non_blocking=True).float()
+
+        seg_logits, depth = model(x)
+
+        mae_all = l1(depth, y_depth.unsqueeze(1)).item()
+        total_mae += mae_all * x.size(0)
+
+        if have_masks and (y_seg is not None):
+            y_seg = y_seg.to(device, non_blocking=True).long()
+            preds = seg_logits.argmax(dim=1)  # (B,H,W)
+            miou = compute_mean_iou(preds, y_seg, num_classes=num_classes)
+            if not math.isnan(miou):
+                total_iou += miou * x.size(0)
+
+            abs_err = (depth - y_depth.unsqueeze(1)).abs()  # (B,1,H,W)
+            lane_mask = (y_seg > 0).unsqueeze(1)            # (B,1,H,W)
+            if lane_mask.any():
+                lane_mae = abs_err[lane_mask].mean().item()
+            else:
+                lane_mae = float("nan")
+            if not math.isnan(lane_mae):
+                total_lane_mae += lane_mae * x.size(0)
+
+        n += x.size(0)
+
+    if n == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    avg_mae = total_mae / n
+    if have_masks:
+        avg_iou = total_iou / n if total_iou > 0 else float("nan")
+        avg_lane_mae = total_lane_mae / n if total_lane_mae > 0 else float("nan")
+        return avg_iou, avg_mae, avg_lane_mae
+    else:
+        return float("nan"), avg_mae, float("nan")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--w_seg", type=float, default=1.0)
+    p.add_argument("--w_depth", type=float, default=1.0)
+    p.add_argument("--save_dir", type=str, default="logs")
+    p.add_argument("--allow_missing_masks", action="store_true",
+                   help="Depth-only mode if loader doesn't supply segmentation labels.")
+    args = p.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    if load_road_data is None:
+        raise RuntimeError(
+            "Could not import load_data from datasets/road_dataset.py. "
+            "Make sure you're using the course-provided road_dataset.py."
+        )
+
+    # Try calling road_dataset.load_data with minimal parameters first;
+    # fall back to richer signatures if supported.
+    loaders = None
+    tried = []
+    for call in (
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers),
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, image_size=(96,128)),
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data"),
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data", image_size=(96,128)),
+    ):
+        try:
+            loaders = call()
+            break
+        except TypeError as e:
+            tried.append(str(e))
+            continue
+    if loaders is None:
+        raise RuntimeError("road_dataset.load_data signature mismatch. Tried variants:\n" + "\n".join(tried))
+
+    train_loader = loaders.get("train") or loaders.get("trn")
+    val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
+    if train_loader is None or val_loader is None:
+        raise RuntimeError("road_dataset.load_data() did not return expected loaders for train/val")
+
+    # --- One-batch sanity check so you immediately see labels & depth are present ---
+    try:
+        dbg = next(iter(train_loader))
+        seg_dbg = get_seg(dbg)
+        depth_dbg = get_depth(dbg)
+        seg_uni = seg_dbg.unique().tolist() if seg_dbg is not None else []
+        d_mean = float(depth_dbg.float().mean()) if depth_dbg is not None else float("nan")
+        d_std  = float(depth_dbg.float().std())  if depth_dbg is not None else float("nan")
+        print(f"[Sanity] seg classes: {seg_uni if seg_uni else 'N/A'} | depth mean {d_mean:.4f} std {d_std:.4f}")
+    except Exception as e:
+        print(f"[Sanity] Could not sample a debug batch: {e}")
+
+    model = Detector().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+
+    # If loader provides no masks, force seg loss to 0 (depth-only)
+    have_masks = True
+    try:
+        # peek again to decide
+        have_masks = get_seg(next(iter(train_loader))) is not None and (args.w_seg > 0.0) and (not args.allow_missing_masks)
+    except Exception:
+        have_masks = not args.allow_missing_masks
+
+    effective_w_seg = args.w_seg if have_masks else 0.0
+    if have_masks and effective_w_seg <= 0.0:
+        print("[Warn] w_seg <= 0 with masks present; segmentation will not learn.")
+
+    best_iou, best_path = -float("inf"), None
+    for epoch in range(1, args.epochs + 1):
+        tr_loss = train_one_epoch(model, train_loader, optimizer, device,
+                                  w_seg=effective_w_seg, w_depth=args.w_depth, have_masks=have_masks)
+        val_iou, val_mae, val_lane_mae = evaluate(model, val_loader, device, have_masks=have_masks)
+
+        iou_str  = "N/A" if (math.isnan(val_iou)) else f"{val_iou:.4f}"
+        lane_str = "N/A" if (math.isnan(val_lane_mae)) else f"{val_lane_mae:.4f}"
+        print(f"Epoch {epoch:02d} | train loss {tr_loss:.4f} | val IoU {iou_str} | MAE {val_mae:.4f} | lane MAE {lane_str}")
+
+        score_for_sched = (val_iou if not math.isnan(val_iou) else -val_mae)
+        scheduler.step(score_for_sched)
+
+        if not math.isnan(val_iou) and val_iou > best_iou:
+            best_iou = val_iou
+            best_path = save_checkpoint(model, out_dir=args.save_dir, prefix="detector")
+            save_for_grader(model)  # writes homework/detector.th for the grader
+            print(f"  ↳ New best IoU: {best_iou:.4f}. Saved to {best_path} and homework/detector.th")
+
+    if best_path is None:
+        best_path = save_checkpoint(model, out_dir=args.save_dir, prefix="detector_final")
+        print(f"Saved final detector checkpoint to {best_path}")
+    save_for_grader(model)  # refresh homework/detector.th with final state
+    best_str = "N/A" if math.isnan(best_iou) or best_iou == -float("inf") else f"{best_iou:.4f}"
+    print(f"Best IoU {best_str} | Best path {best_path}")
+
+
+if __name__ == "__main__":
+    main()
