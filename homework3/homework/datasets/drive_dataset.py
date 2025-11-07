@@ -1,6 +1,7 @@
-
+# homework/datasets/drive_dataset.py
 import os
 from pathlib import Path
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -10,26 +11,49 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 
 
-def _find_mask_and_depth(img_path: Path):
+# ---------- Helpers ----------
+
+def _strip_known_suffixes(stem: str) -> str:
     """
-    Try to find matching mask/depth files for an image.
-    Supports same-folder names and common subfolders like 'track/', 'seg/', 'masks/', 'labels/', 'lane/', 'depth/'.
+    Remove common trailing tokens used in filenames, e.g. *_im, *_rgb, *_image.
+    """
+    for suf in ["_im", "_rgb", "_image"]:
+        if stem.endswith(suf):
+            return stem[: -len(suf)]
+    return stem
+
+
+def _base_id_from_image_path(img_path: Path) -> str:
+    """
+    Derive a base id usable to find matching mask/depth.
+    Examples:
+      00000_im.jpg   -> 00000
+      frame_001_rgb.png -> frame_001
+      00042.png      -> 00042
+    """
+    stem = img_path.stem  # filename without extension
+    stem = _strip_known_suffixes(stem)
+    return stem
+
+
+def _first_existing(candidates: List[Path]) -> Optional[Path]:
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _find_mask_and_depth(img_path: Path) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Try to find matching mask/depth files near an image.
+    Supports same-folder names and common subfolders like
+    'track/', 'seg/', 'masks/', 'labels/', 'lane/', 'depth/'.
     Returns (mask_path or None, depth_path or None).
     """
-    base = img_path.name
-    # strip common image suffix patterns like *_im.jpg, *_im.png
-    if base.endswith("_im.jpg"):
-        base = base[:-7]  # remove "_im.jpg"
-    elif base.endswith("_im.jpeg"):
-        base = base[:-8]
-    elif base.endswith("_im.png"):
-        base = base[:-7]
-    else:
-        base = img_path.stem  # generic fallback
-
+    base = _base_id_from_image_path(img_path)
     root = img_path.parent
 
-    # Candidates in same folder (most common)
+    # Same-folder candidates
     mask_candidates = [
         root / f"{base}_track.png",
         root / f"{base}_seg.png",
@@ -37,23 +61,24 @@ def _find_mask_and_depth(img_path: Path):
         root / f"{base}_labels.png",
         root / f"{base}_lane.png",
         root / f"{base}_lane_mask.png",
-        root / f"{base}.png",  # sometimes just base.png
+        root / f"{base}.png",  # plain base.png
     ]
     depth_candidates = [
         root / f"{base}_depth.png",
         root / f"{base}_depth.jpg",
-        root / f"{base}.png",
+        root / f"{base}.png",   # sometimes depth is just base.png
         root / f"{base}.jpg",
     ]
 
-    # Candidates in subfolders
+    # Subfolder candidates
     for sd in ["track", "seg", "masks", "labels", "lane"]:
         mask_candidates += [
             root / sd / f"{base}.png",
             root / sd / f"{base}_track.png",
             root / sd / f"{base}_seg.png",
+            root / sd / f"{base}_mask.png",
         ]
-    for sd in ["depth"]:
+    for sd in ["depth", "depths"]:
         depth_candidates += [
             root / sd / f"{base}.png",
             root / sd / f"{base}.jpg",
@@ -61,17 +86,16 @@ def _find_mask_and_depth(img_path: Path):
             root / sd / f"{base}_depth.jpg",
         ]
 
-    mask_path = next((p for p in mask_candidates if p.exists()), None)
-    depth_path = next((p for p in depth_candidates if p.exists()), None)
-    return mask_path, depth_path
+    return _first_existing(mask_candidates), _first_existing(depth_candidates)
 
+
+# ---------- Dataset ----------
 
 class DriveDataset(Dataset):
     """
     Expects episodes like:
-      drive_data/train/cornfield_crossing_00/00000_im.jpg
-      drive_data/train/cornfield_crossing_00/00000_depth.png (or in depth/)
-      drive_data/train/cornfield_crossing_00/00000_track.png (or in track/)
+      drive_data/train/<episode>/<image files>
+    where matching mask/depth files are in the same folder or in common subfolders.
 
     If require_masks=True, samples without masks are skipped.
     """
@@ -85,18 +109,34 @@ class DriveDataset(Dataset):
         if not self.root.is_dir():
             raise FileNotFoundError(f"Root not found: {root}")
 
-        # Find image files: *_im.jpg (primary) + fallbacks *_im.png
-        im_paths = sorted(list(self.root.glob("*/*_im.jpg"))) + sorted(list(self.root.glob("*/*_im.png")))
+        # Find image files: prefer *_im.{jpg,png}, but also accept plain {jpg,png}
+        im_paths = sorted(list(self.root.glob("*/*_im.jpg"))) + \
+                   sorted(list(self.root.glob("*/*_im.png")))
         if not im_paths:
-            raise FileNotFoundError(f"No '*_im.jpg' (or png) files found under {root}")
+            # Fall back to any jpg/png under episode folders
+            im_paths = sorted(list(self.root.glob("*/*.jpg"))) + \
+                       sorted(list(self.root.glob("*/*.png")))
+        if not im_paths:
+            raise FileNotFoundError(f"No image files found under {root}")
+
+        n_total, n_with_mask, n_with_depth = 0, 0, 0
 
         for imf in im_paths:
+            n_total += 1
             maskf, depthf = _find_mask_and_depth(imf)
-            # Depth is required for this assignment; skip if missing
+
+            if depthf is not None:
+                n_with_depth += 1
+
+            if self.require_masks:
+                if maskf is None:
+                    # skip when masks are required
+                    continue
+                else:
+                    n_with_mask += 1
+
+            # If depth missing, skip (depth is required for assignment)
             if depthf is None:
-                continue
-            # If masks are required, skip when missing
-            if self.require_masks and maskf is None:
                 continue
 
             self.samples.append({"img": imf, "mask": maskf, "depth": depthf})
@@ -110,6 +150,7 @@ class DriveDataset(Dataset):
             else:
                 raise FileNotFoundError(f"No (image, depth) pairs found under {root}")
 
+        print(f"[DriveDataset] Scanned {n_total} images, found depth for {n_with_depth}, masks for {n_with_mask} (require_masks={self.require_masks})")
         print(f"[DriveDataset] Loaded {len(self.samples)} samples from {root}")
 
     def __len__(self):
@@ -120,7 +161,6 @@ class DriveDataset(Dataset):
 
         # --- Image ---
         img = Image.open(rec["img"]).convert("RGB")
-        # to tensor [0,1], then resize bilinear on tensor
         img = TF.to_tensor(img)  # (3,H,W) float in [0,1]
         if self.image_size is not None:
             img = TF.resize(img, size=[self.image_size[0], self.image_size[1]],
@@ -147,11 +187,10 @@ class DriveDataset(Dataset):
                 mask = mask.squeeze(0).to(dtype=torch.long)
 
         out = {"image": img, "depth": depth}
-        # For the trainer/evaluator convenience, include 'track' even if missing (depth-only mode)
+        # Provide 'track' always for trainer; background-only if mask missing
         if mask is not None:
             out["track"] = mask
         else:
-            # Provide a background-only tensor so shapes are consistent if caller expects it
             H, W = depth.shape
             out["track"] = torch.zeros((H, W), dtype=torch.long)
 
