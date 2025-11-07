@@ -145,7 +145,7 @@ def main():
     print(f"Using device: {device}")
 
     if load_data is None:
-        raise RuntimeError("Could not import load_data from homework.datasets.drive_dataset")
+        raise RuntimeError("Could not import load_data from homework.datasets.road_dataset")
 
     # Default: require masks (full training). Only skip if user explicitly allows missing masks.
     have_masks = not args.allow_missing_masks
