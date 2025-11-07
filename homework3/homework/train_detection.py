@@ -49,13 +49,13 @@ def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, ha
 
     running_loss, n = 0.0, 0
     for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)         # (B,3,96,128)
+        x = batch["image"].to(device, non_blocking=True)              # (B,3,96,128)
         y_seg = batch["track"].to(device, non_blocking=True).long()   # (B,96,128) in {0,1,2}
-        y_depth = batch["depth"].to(device, non_blocking=True).float() # (B,96,128) in [0,1]
+        y_depth = batch["depth"].to(device, non_blocking=True).float()# (B,96,128) in [0,1]
 
         optimizer.zero_grad(set_to_none=True)
 
-        seg_logits, depth = model(x)                             # seg:(B,3,H,W), depth:(B,1,H,W)
+        seg_logits, depth = model(x)                                  # seg:(B,3,H,W), depth:(B,1,H,W)
 
         # Depth loss (always available)
         loss_depth = l1(depth, y_depth.unsqueeze(1)) * w_depth
@@ -101,7 +101,6 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
         if have_masks:
             preds = seg_logits.argmax(dim=1)  # (B,H,W)
             miou = compute_mean_iou(preds, y_seg, num_classes=num_classes)
-            # If no valid union for any class, miou will be NaN; handle downstream.
             if not math.isnan(miou):
                 total_iou += miou * x.size(0)
 
@@ -151,12 +150,11 @@ def main():
     # Default: require masks (full training). Only skip if user explicitly allows missing masks.
     have_masks = not args.allow_missing_masks
 
+    # Only pass args that your load_data supports
     loaders = load_data(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        require_masks=have_masks,   # strict when masks required
-        pin_memory=True,
-        shuffle=True,
+        require_masks=have_masks,
     )
     train_loader = loaders.get("train") or loaders.get("trn")
     val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
@@ -191,8 +189,8 @@ def main():
         val_iou, val_mae, val_lane_mae = evaluate(model, val_loader, device, have_masks=have_masks)
 
         # pretty print: show "N/A" when masks are missing or IoU invalid
-        iou_str = "N/A" if (math.isnan(val_iou) or val_iou == float("nan")) else f"{val_iou:.4f}"
-        lane_str = "N/A" if (math.isnan(val_lane_mae) or val_lane_mae == float("nan")) else f"{val_lane_mae:.4f}"
+        iou_str = "N/A" if (math.isnan(val_iou)) else f"{val_iou:.4f}"
+        lane_str = "N/A" if (math.isnan(val_lane_mae)) else f"{val_lane_mae:.4f}"
         print(
             f"Epoch {epoch:02d} | train loss {tr_loss:.4f} | "
             f"val IoU {iou_str} | MAE {val_mae:.4f} | lane MAE {lane_str}"
