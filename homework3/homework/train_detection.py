@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader  # noqa: F401 (kept for clarity)
 
-from homework.models import Detector
+from homework.models import Detector, save_model as save_for_grader
 
 # Robust import – assumes you created homework/datasets/drive_dataset.py
 try:
@@ -16,7 +16,7 @@ except Exception:
     load_data = None
 
 
-def save_model(model, out_dir="logs", prefix="detector"):
+def save_checkpoint(model, out_dir="logs", prefix="detector"):
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%m%d_%H%M%S")
     path = os.path.join(out_dir, f"{prefix}_{ts}.th")
@@ -39,7 +39,7 @@ def compute_mean_iou(preds, targets, num_classes=3):
         if union > 0:
             iou_sum += inter / union
             count += 1
-    return (iou_sum / count) if count > 0 else 0.0
+    return (iou_sum / count) if count > 0 else float("nan")
 
 
 def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, have_masks=True):
@@ -49,13 +49,13 @@ def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, ha
 
     running_loss, n = 0.0, 0
     for batch in loader:
-        x = batch["image"].to(device)                # (B,3,96,128)
-        y_seg = batch["track"].to(device).long()     # (B,96,128) in {0,1,2}
-        y_depth = batch["depth"].to(device).float()  # (B,96,128) in [0,1]
+        x = batch["image"].to(device, non_blocking=True)         # (B,3,96,128)
+        y_seg = batch["track"].to(device, non_blocking=True).long()   # (B,96,128) in {0,1,2}
+        y_depth = batch["depth"].to(device, non_blocking=True).float() # (B,96,128) in [0,1]
 
         optimizer.zero_grad(set_to_none=True)
 
-        seg_logits, depth = model(x)                 # seg:(B,3,H,W), depth:(B,1,H,W)
+        seg_logits, depth = model(x)                             # seg:(B,3,H,W), depth:(B,1,H,W)
 
         # Depth loss (always available)
         loss_depth = l1(depth, y_depth.unsqueeze(1)) * w_depth
@@ -88,9 +88,9 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
     n = 0
 
     for batch in loader:
-        x = batch["image"].to(device)
-        y_seg = batch["track"].to(device).long()
-        y_depth = batch["depth"].to(device).float()
+        x = batch["image"].to(device, non_blocking=True)
+        y_seg = batch["track"].to(device, non_blocking=True).long()
+        y_depth = batch["depth"].to(device, non_blocking=True).float()
 
         seg_logits, depth = model(x)
 
@@ -101,7 +101,9 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
         if have_masks:
             preds = seg_logits.argmax(dim=1)  # (B,H,W)
             miou = compute_mean_iou(preds, y_seg, num_classes=num_classes)
-            total_iou += miou * x.size(0)
+            # If no valid union for any class, miou will be NaN; handle downstream.
+            if not math.isnan(miou):
+                total_iou += miou * x.size(0)
 
             abs_err = (depth - y_depth.unsqueeze(1)).abs()  # (B,1,H,W)
             lane_mask = (y_seg > 0).unsqueeze(1)            # (B,1,H,W)
@@ -109,7 +111,8 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
                 lane_mae = abs_err[lane_mask].mean().item()
             else:
                 lane_mae = float("nan")
-            total_lane_mae += lane_mae * x.size(0)
+            if not math.isnan(lane_mae):
+                total_lane_mae += lane_mae * x.size(0)
 
         n += x.size(0)
 
@@ -117,7 +120,9 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
         return float("nan"), float("nan"), float("nan")
 
     if have_masks:
-        return total_iou / n, total_mae / n, total_lane_mae / n
+        avg_iou = total_iou / n if total_iou > 0 else float("nan")
+        avg_lane_mae = total_lane_mae / n if total_lane_mae > 0 else float("nan")
+        return avg_iou, total_mae / n, avg_lane_mae
     else:
         # No masks -> IoU and lane MAE not meaningful
         return float("nan"), total_mae / n, float("nan")
@@ -134,7 +139,7 @@ def main():
     p.add_argument("--w_depth", type=float, default=1.0)
     p.add_argument("--save_dir", type=str, default="logs")
     p.add_argument("--allow_missing_masks", action="store_true",
-                   help="Enable depth-only training/eval when segmentation masks are absent.")
+                   help="Depth-only mode when segmentation masks are absent.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -143,18 +148,32 @@ def main():
     if load_data is None:
         raise RuntimeError("Could not import load_data from homework.datasets.drive_dataset")
 
-    # If masks are missing, we run in dev mode (depth only).
+    # Default: require masks (full training). Only skip if user explicitly allows missing masks.
     have_masks = not args.allow_missing_masks
 
     loaders = load_data(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         require_masks=have_masks,   # strict when masks required
+        pin_memory=True,
+        shuffle=True,
     )
     train_loader = loaders.get("train") or loaders.get("trn")
     val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     if train_loader is None or val_loader is None:
         raise RuntimeError("drive_dataset.load_data() did not return expected loaders for train/val")
+
+    # --- One-batch sanity check so you immediately see label coverage ---
+    try:
+        dbg = next(iter(train_loader))
+        trk_unique = torch.unique(dbg["track"])
+        d_mean = float(dbg["depth"].float().mean())
+        d_std = float(dbg["depth"].float().std())
+        print(f"[Sanity] track unique (train): {trk_unique.tolist()} | depth mean {d_mean:.4f} std {d_std:.4f}")
+        if have_masks and set(trk_unique.tolist()) == {0}:
+            print("[Warn] Train masks appear to be all background (only {0}). Check dataset/transform pipeline.")
+    except Exception as e:
+        print(f"[Sanity] Could not sample a debug batch: {e}")
 
     model = Detector().to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -162,6 +181,8 @@ def main():
 
     # If masks are missing, force seg loss to 0.0
     effective_w_seg = 0.0 if (not have_masks) else args.w_seg
+    if have_masks and effective_w_seg <= 0.0:
+        print("[Warn] w_seg <= 0 with masks present; segmentation will not learn.")
 
     best_iou, best_path = -float("inf"), None
     for epoch in range(1, args.epochs + 1):
@@ -169,9 +190,9 @@ def main():
                                   w_seg=effective_w_seg, w_depth=args.w_depth, have_masks=have_masks)
         val_iou, val_mae, val_lane_mae = evaluate(model, val_loader, device, have_masks=have_masks)
 
-        # pretty print: show "N/A" when masks are missing
-        iou_str = "N/A" if math.isnan(val_iou) else f"{val_iou:.4f}"
-        lane_str = "N/A" if math.isnan(val_lane_mae) else f"{val_lane_mae:.4f}"
+        # pretty print: show "N/A" when masks are missing or IoU invalid
+        iou_str = "N/A" if (math.isnan(val_iou) or val_iou == float("nan")) else f"{val_iou:.4f}"
+        lane_str = "N/A" if (math.isnan(val_lane_mae) or val_lane_mae == float("nan")) else f"{val_lane_mae:.4f}"
         print(
             f"Epoch {epoch:02d} | train loss {tr_loss:.4f} | "
             f"val IoU {iou_str} | MAE {val_mae:.4f} | lane MAE {lane_str}"
@@ -181,15 +202,19 @@ def main():
         score_for_sched = (val_iou if not math.isnan(val_iou) else -val_mae)
         scheduler.step(score_for_sched)
 
+        # Save "best for grader" when IoU improves
         if not math.isnan(val_iou) and val_iou > best_iou:
             best_iou = val_iou
-            best_path = save_model(model, out_dir=args.save_dir, prefix="detector")
-            print(f"  ↳ New best IoU: {best_iou:.4f}. Saved to {best_path}")
+            best_path = save_checkpoint(model, out_dir=args.save_dir, prefix="detector")
+            save_for_grader(model)  # writes homework/detector.th for the grader
+            print(f"  ↳ New best IoU: {best_iou:.4f}. Saved to {best_path} and homework/detector.th")
 
-    best_str = "N/A" if math.isnan(best_iou) or best_iou == -float("inf") else f"{best_iou:.4f}"
+    # Always ensure the grader file exists at the end (last weights if no best IoU recorded)
     if best_path is None:
-        best_path = save_model(model, out_dir=args.save_dir, prefix="detector_final")
+        best_path = save_checkpoint(model, out_dir=args.save_dir, prefix="detector_final")
         print(f"Saved final detector checkpoint to {best_path}")
+    save_for_grader(model)  # refresh homework/detector.th with final state
+    best_str = "N/A" if math.isnan(best_iou) or best_iou == -float("inf") else f"{best_iou:.4f}"
     print(f"Best IoU {best_str} | Best path {best_path}")
 
 
