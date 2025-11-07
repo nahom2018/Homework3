@@ -9,11 +9,20 @@ from torch.utils.data import DataLoader  # noqa: F401 (kept for clarity)
 
 from homework.models import Detector, save_model as save_for_grader
 
-# Robust import – assumes you created homework/datasets/drive_dataset.py
+# Correct dataset import (README typo): prefer road_dataset; fall back to drive_dataset if needed
+load_data = None
 try:
-    from homework.datasets.drive_dataset import load_data
+    from homework.datasets.road_dataset import load_data as load_data  # primary
 except Exception:
-    load_data = None
+    try:
+        # some bundles put it at homework/road_dataset.py
+        from homework.road_dataset import load_data as load_data
+    except Exception:
+        try:
+            # last-resort fallback for older local copies
+            from homework.datasets.drive_dataset import load_data as load_data
+        except Exception:
+            load_data = None
 
 
 def save_checkpoint(model, out_dir="logs", prefix="detector"):
@@ -145,12 +154,15 @@ def main():
     print(f"Using device: {device}")
 
     if load_data is None:
-        raise RuntimeError("Could not import load_data from homework.datasets.road_dataset")
+        raise RuntimeError(
+            "Could not import load_data from datasets/road_dataset.py. "
+            "Make sure you're using the course-provided road_dataset.py."
+        )
 
     # Default: require masks (full training). Only skip if user explicitly allows missing masks.
     have_masks = not args.allow_missing_masks
 
-    # Only pass args that your load_data supports
+    # Only pass args that your loader supports (road_dataset usually takes these)
     loaders = load_data(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -159,7 +171,7 @@ def main():
     train_loader = loaders.get("train") or loaders.get("trn")
     val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     if train_loader is None or val_loader is None:
-        raise RuntimeError("drive_dataset.load_data() did not return expected loaders for train/val")
+        raise RuntimeError("road_dataset.load_data() did not return expected loaders for train/val")
 
     # --- One-batch sanity check so you immediately see label coverage ---
     try:
