@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader  # noqa: F401
 
 from homework.models import Detector, save_model as save_for_grader
 
-# Prefer the correct loader (README typo mentioned): road_dataset
+# Prefer the correct loader from road_dataset
 load_data = None
 try:
     from homework.datasets.road_dataset import load_data as load_data
@@ -53,7 +53,7 @@ def _get_depth(batch):
     for k in ("depth", "depths"):
         if k in batch and batch[k] is not None:
             return batch[k]
-    raise KeyError("Depth tensor not found in batch (looking for keys: depth/depths).")
+    raise KeyError("Depth tensor not found in batch (looked for keys: depth/depths).")
 
 
 def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, have_masks=True):
@@ -63,7 +63,7 @@ def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, ha
 
     running_loss, n = 0.0, 0
     for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)           # (B,3,H,W)
+        x = batch["image"].to(device, non_blocking=True)             # (B,3,H,W)
         y_depth = _get_depth(batch).to(device, non_blocking=True).float()  # (B,H,W)
 
         y_seg = _get_seg(batch)
@@ -71,7 +71,7 @@ def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, ha
             y_seg = y_seg.to(device, non_blocking=True).long()
 
         optimizer.zero_grad(set_to_none=True)
-        seg_logits, depth = model(x)                               # seg:(B,3,H,W), depth:(B,1,H,W)
+        seg_logits, depth = model(x)                                  # seg:(B,3,H,W), depth:(B,1,H,W)
 
         loss_depth = l1(depth, y_depth.unsqueeze(1)) * w_depth
         loss_seg = ce(seg_logits, y_seg) * w_seg if (have_masks and y_seg is not None and w_seg > 0.0) \
@@ -142,6 +142,7 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset_path", type=str, default="drive_data", help="Path that contains train/ and val/ dirs")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -163,30 +164,21 @@ def main():
             "Ensure the file exists and is importable."
         )
 
-    # Call road_dataset.load_data WITHOUT 'require_masks' (not supported)
-    # Try a couple of common signatures to be safe:
-    loaders = None
-    tries = []
-    for call in (
-        lambda: load_data(batch_size=args.batch_size, num_workers=args.num_workers),
-        lambda: load_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data"),
-        lambda: load_data(batch_size=args.batch_size, num_workers=args.num_workers, image_size=(96,128)),
-        lambda: load_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data", image_size=(96,128)),
-    ):
-        try:
-            loaders = call()
-            break
-        except TypeError as e:
-            tries.append(str(e))
-            continue
+    # road_dataset.load_data expects the dataset path as the FIRST positional arg
+    # and (based on your error) doesn't accept root/image_size/require_masks.
+    loaders = load_data(args.dataset_path, batch_size=args.batch_size, num_workers=args.num_workers)
 
-    if loaders is None:
-        raise RuntimeError("road_dataset.load_data signature mismatch. Tried:\n" + "\n".join(tries))
+    # Accept both dict or tuple returns
+    if isinstance(loaders, dict):
+        train_loader = loaders.get("train") or loaders.get("trn")
+        val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
+    elif isinstance(loaders, (list, tuple)) and len(loaders) >= 2:
+        train_loader, val_loader = loaders[0], loaders[1]
+    else:
+        raise RuntimeError("road_dataset.load_data() returned an unexpected type. Expect dict with train/val or (train_loader, val_loader).")
 
-    train_loader = loaders.get("train") or loaders.get("trn")
-    val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     if train_loader is None or val_loader is None:
-        raise RuntimeError("road_dataset.load_data() did not return expected loaders for train/val")
+        raise RuntimeError("road_dataset.load_data() did not provide both train and val loaders.")
 
     # Peek one batch to decide if masks exist; allow override with --allow_missing_masks
     try:
@@ -201,7 +193,7 @@ def main():
         d_std  = float(depth_dbg.float().std())  if depth_dbg is not None else float("nan")
         print(f"[Sanity] seg classes: {seg_uni if seg_uni else 'N/A'} | depth mean {d_mean:.4f} std {d_std:.4f}")
         if have_masks and set(seg_uni) == {0}:
-            print("[Warn] Masks appear to be all background; IoU will be low. Verify dataset labels.")
+            print("[Warn] Masks appear to be all background; IoU will be low. Verify labels.")
     except Exception as e:
         print(f"[Sanity] Could not sample a debug batch: {e}")
         have_masks = not args.allow_missing_masks  # conservative default
