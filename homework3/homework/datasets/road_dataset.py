@@ -120,8 +120,11 @@ class RoadDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         frame_id = int(self.indices[idx])
-        # road_transforms.ImageLoader expects '_idx' for naming like 00000_im.jpg
-        sample = {"_idx": frame_id}
+        # Satisfy both single-frame and multi-frame loaders
+        sample = {
+            "_idx": frame_id,  # for ImageLoader expecting 00000_im.jpg
+            "_frames": [frame_id],  # for any sequence/stack loader expecting a list
+        }
         return self.transform(sample)
 
 
