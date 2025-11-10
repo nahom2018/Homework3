@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+from torchvision import transforms
 
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -14,9 +15,9 @@ class SuperTuxDataset(Dataset):
     """
 
     def __init__(
-        self,
-        dataset_path: str,
-        transform_pipeline: str = "default",
+            self,
+            dataset_path: str,
+            transform_pipeline: str = "default",
     ):
         self.transform = self.get_transform(transform_pipeline)
         self.data = []
@@ -30,17 +31,18 @@ class SuperTuxDataset(Dataset):
                     self.data.append((img_path, label_id))
 
     def get_transform(self, transform_pipeline: str = "default"):
+
         xform = None
 
         if transform_pipeline == "default":
             xform = transforms.ToTensor()
         elif transform_pipeline == "aug":
-            # construct your custom augmentation
             xform = transforms.Compose(
                 [
-                    # TODO: fix
-                    # transforms.ColorJitter(0.9, 0.9, 0.9, 0.1),
-                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomResizedCrop(64, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.RandomRotation(degrees=10),
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
                     transforms.ToTensor(),
                 ]
             )
@@ -65,12 +67,12 @@ class SuperTuxDataset(Dataset):
 
 
 def load_data(
-    dataset_path: str,
-    transform_pipeline: str = "default",
-    return_dataloader: bool = True,
-    num_workers: int = 2,
-    batch_size: int = 128,
-    shuffle: bool = False,
+        dataset_path: str,
+        transform_pipeline: str = "default",
+        return_dataloader: bool = True,
+        num_workers: int = 2,
+        batch_size: int = 128,
+        shuffle: bool = False,
 ) -> DataLoader | Dataset:
     """
     Constructs the dataset/dataloader.
