@@ -23,26 +23,34 @@ class RoadDataset(Dataset):
 
         self.track = Track(**info["track"].item())
         self.frames: dict[str, np.ndarray] = {k: np.stack(v) for k, v in info["frames"].item().items()}
-        self.transform = self.get_transform(transform_pipeline)
+        self.transform = self.get_transform("eval" if transform_pipeline is None else transform_pipeline)
 
-    def get_transform(self, transform_pipeline: str):
-        xform = None
+    def get_transform(self, transform_pipeline: Optional[str]):
+        """
+        Build a transform pipeline.
+        - None, "default", "eval", "val", "test", "none"  -> default (no augmentation)
+        - "aug" (or "train")                              -> augmentation pipeline (currently same as default; customize if desired)
+        """
 
-        if transform_pipeline == "default":
-            xform = road_transforms.Compose(
+        alias = (transform_pipeline or "default").lower()
+
+        def _default_pipeline():
+            return road_transforms.Compose(
                 [
                     road_transforms.ImageLoader(self.episode_path),
                     road_transforms.DepthLoader(self.episode_path),
                     road_transforms.TrackProcessor(self.track),
                 ]
             )
-        elif transform_pipeline == "aug":
-            pass
 
-        if xform is None:
-            raise ValueError(f"Invalid transform {transform_pipeline} specified!")
+        def _aug_pipeline():\
+            return _default_pipeline()
 
-        return xform
+        if alias in {"default", "eval", "val", "test", "none"}:
+            return _default_pipeline()
+        if alias in {"aug", "train"}:
+            return _aug_pipeline()
+        return _default_pipeline()
 
     def __len__(self):
         return len(self.frames["location"])
