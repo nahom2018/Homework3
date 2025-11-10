@@ -1,64 +1,63 @@
-# --- imports (ensure these are present at top of file) ---
+# ------------------ road_dataset.py ------------------
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import numpy as np
 import torch
-from . import road_transforms
+
+# Use relative imports inside the package
+from . import road_transforms  # and add similar for road_utils if you use it
 
 
-# ===================== RoadDataset =====================
+# ===================== Dataset =====================
 
 class RoadDataset(torch.utils.data.Dataset):
+    """
+    A single SuperTuxKart driving episode.
+    Expects:
+      episode_path/
+        info.npz
+        image/   (frames)
+        depth/   (frames)
+        ... (whatever your loaders expect)
+    """
     def __init__(self, episode_path, transform_pipeline: Optional[str] = None, allow_missing_masks: bool = False):
-        """
-        episode_path: path to a single episode directory that contains info.npz (and images/depth)
-        """
         self.episode_path = Path(episode_path)
-        self.allow_missing_masks = allow_missing_masks
+        self.allow_missing_masks = bool(allow_missing_masks)
 
-        # Load per-episode info
         info_path = self.episode_path / "info.npz"
         if not info_path.exists():
             raise FileNotFoundError(f"Missing info.npz at {info_path}")
+
         info = np.load(str(info_path), allow_pickle=True)
         self.info = info
-
-        # Extract track masks if present
         files = getattr(info, "files", [])
+
+        # Extract per-episode track masks if present
         self.track = info["track"] if ("track" in files) else None
         self.has_masks = self.track is not None
 
-        # If masks are required (val/test) but missing, fail early
+        # If masks required (val/test), enforce presence
         if not self.allow_missing_masks and not self.has_masks:
-            raise FileNotFoundError(
-                f"No 'track' masks in {info_path} but masks are required for this split."
-            )
+            raise FileNotFoundError(f"No 'track' masks in {info_path} but masks are required for this split.")
 
-        # Build transform (defaults to "default" if None)
+        # Build transform (define AFTER has_masks is known)
         self.transform = self.get_transform("default" if transform_pipeline is None else transform_pipeline)
 
-        # ===== index/length bookkeeping =====
+        # ---- Frame index bookkeeping ----
         img_dir = self.episode_path / "image"
         exts = {".png", ".jpg", ".jpeg"}
 
-        # 1) prefer an explicit list if present in info.npz
-        files = getattr(self.info, "files", [])
-        if "indices" in files:
-            self.indices = list(self.info["indices"])
-        # 2) otherwise, infer from image/ filenames
+        if "indices" in files:  # explicit indices in info.npz
+            self.indices: List[int] = [int(x) for x in list(self.info["indices"])]
         elif img_dir.exists():
-            frame_files = sorted(
-                [p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
-            )
-            if len(frame_files) == 0:
+            frame_files = sorted(p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+            if not frame_files:
                 raise FileNotFoundError(f"No frames found in {img_dir}")
-            # If filenames are numeric like 000.png, 001.png...
             try:
-                self.indices = [int(p.stem) for p in frame_files]
+                self.indices = [int(p.stem) for p in frame_files]  # numeric stems like 000.png
             except ValueError:
-                # Fallback: just enumerate the files 0..N-1
+                # fallback to range if stems are not numeric
                 self.indices = list(range(len(frame_files)))
-        # 3) last resort: look for a length/n field in info.npz
         elif "length" in files:
             self.indices = list(range(int(self.info["length"])))
         elif "n" in files:
@@ -66,30 +65,17 @@ class RoadDataset(torch.utils.data.Dataset):
         else:
             raise RuntimeError(
                 f"Could not infer frame indices for episode {self.episode_path}. "
-                f"Expected an 'image/' folder or 'indices'/'length' in info.npz."
+                f"Expected 'image/' folder or 'indices'/'length'/'n' in info.npz."
             )
 
         self.length = len(self.indices)
 
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        # frame id used by your loaders/transforms to pick the right files
-        frame_id = self.indices[idx]
-
-        # Many road_transforms pipelines expect a dict input and add keys progressively.
-        # If YOUR Compose expects just an int, change the next two lines to:
-        #   return self.transform(frame_id)
-        sample = {"index": int(frame_id)}
-        return self.transform(sample)
-
-
-def get_transform(self, transform_pipeline: Optional[str]):
+    # >>>>>>>>>>> define get_transform AS A METHOD OF THE CLASS <<<<<<<<<<
+    def get_transform(self, transform_pipeline: Optional[str]):
         """
         Build a transform pipeline.
-        - None, "default", "eval", "val", "test", "none" -> default (no augmentation)
-        - "aug" or "train"                               -> augmentation pipeline (customize if desired)
+          - None, default/eval/val/test/none => default (no aug)
+          - aug/train                       => augmentation pipeline (customize if desired)
         """
         alias = (transform_pipeline or "default").lower()
 
@@ -98,20 +84,18 @@ def get_transform(self, transform_pipeline: Optional[str]):
                 road_transforms.ImageLoader(self.episode_path),
                 road_transforms.DepthLoader(self.episode_path),
             ]
-            # Only include TrackProcessor when masks exist
             if self.has_masks:
                 ops.append(road_transforms.TrackProcessor(self.track))
             return road_transforms.Compose(ops)
 
         def _aug():
-            # Start with default ops; add your aug ops here if available in road_transforms
             ops = [
                 road_transforms.ImageLoader(self.episode_path),
                 road_transforms.DepthLoader(self.episode_path),
             ]
             if self.has_masks:
                 ops.append(road_transforms.TrackProcessor(self.track))
-            # Example (uncomment if your road_transforms defines them):
+            # Example aug (uncomment if defined in your road_transforms):
             # ops.append(road_transforms.RandomHorizontalFlip(p=0.5))
             return road_transforms.Compose(ops)
 
@@ -119,11 +103,15 @@ def get_transform(self, transform_pipeline: Optional[str]):
             return _default()
         if alias in {"aug", "train"}:
             return _aug()
-
-        # Fallback to default
         return _default()
 
-    # keep your __len__, __getitem__, etc. unchanged
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        frame_id = int(self.indices[idx])
+        sample = {"index": frame_id}
+        return self.transform(sample)
 
 
 # ===================== Data loading =====================
@@ -166,7 +154,7 @@ def load_data(dataset_path,
     if not train_eps:
         raise FileNotFoundError(f"No episodes with info.npz under {train_dir}")
 
-    # If val is missing, carve 80/20 out of train
+    # If val missing, carve 80/20 from train
     if not val_eps:
         rng = np.random.RandomState(seed)
         idx = np.arange(len(train_eps))
@@ -183,12 +171,10 @@ def load_data(dataset_path,
         per_episode = [
             RoadDataset(
                 ep,
-                # If caller didn’t specify, use "aug" for train, "default" for val/test
                 transform_pipeline=(
                     "aug" if (transform_pipeline is None and split_name == "train")
                     else ("default" if transform_pipeline is None else transform_pipeline)
                 ),
-                # ✅ Only allow missing masks for TRAIN
                 allow_missing_masks=(split_name == "train" and allow_missing_masks),
             )
             for ep in episode_dirs
@@ -206,3 +192,4 @@ def load_data(dataset_path,
     val_loader   = _make_loader(val_eps,   "val")
     test_loader  = _make_loader(test_eps,  "test")
     return train_loader, val_loader, test_loader
+# ------------------ end road_dataset_
