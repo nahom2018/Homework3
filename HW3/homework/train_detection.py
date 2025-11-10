@@ -1,5 +1,5 @@
 import argparse, time, torch, torch.nn as nn, torch.optim as optim
-from models import load_model
+from homework.models import load_model
 
 def import_drive_loader():
     for name in ["drive_dataset","road_dataset"]:
