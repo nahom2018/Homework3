@@ -117,10 +117,13 @@ def load_data(dataset_path, batch_size=32, num_workers=2, transform_pipeline=Non
         per_episode = [
             RoadDataset(
                 ep,
-                # If caller didn’t specify, use aug for train, default for others
-                transform_pipeline=("aug" if (transform_pipeline is None and split_name == "train") else
-                                    ("default" if transform_pipeline is None else transform_pipeline)),
-                allow_missing_masks=allow_missing_masks,
+
+                transform_pipeline=(
+                    "aug" if (transform_pipeline is None and split_name == "train") else
+                    ("default" if transform_pipeline is None else transform_pipeline)
+                ),
+
+                allow_missing_masks=(split_name == "train" and allow_missing_masks),
             )
             for ep in episode_dirs
         ]
@@ -132,7 +135,6 @@ def load_data(dataset_path, batch_size=32, num_workers=2, transform_pipeline=Non
             num_workers=num_workers,
             pin_memory=True,
         )
-
     train_loader = _make_loader(train_eps, "train")
     val_loader   = _make_loader(val_eps,   "val")
     test_loader  = _make_loader(test_eps,  "test")
