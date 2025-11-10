@@ -1,21 +1,22 @@
 """
-SuperTuxKart Drive Dataset loader for segmentation (track) + depth (optional).
+Tolerant SuperTuxKart Drive Dataset loader.
 
-If depth files are missing, we:
-  - return a dummy zeros depth map aligned to track
-  - expose has_depth=0 so the trainer can skip the depth loss
-
-Per-sample output:
+Goals:
+- No hard requirement for an 'images/' subfolder.
+- Accept frames as filenames or numeric indices.
+- If track in info.npz is (H,W) for the episode, tile it to frame count.
+- If depth.npz missing, provide zeros and set has_depth=0.
+- Output per item:
   {
     "image": (3,96,128) float32 normalized,
     "depth": (96,128) float32 in [0,1] (zeros if missing),
     "track": (96,128) int64 {0,1,2},
-    "has_depth": uint8 tensor scalar in {0,1}
+    "has_depth": uint8 scalar {0,1}
   }
 """
 
 from __future__ import annotations
-import os
+import os, glob
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -31,65 +32,56 @@ from torchvision import transforms
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD  = [0.2064, 0.1944, 0.2252]
 
-# Target size
 TARGET_HW = (96, 128)  # (H, W)
-
 
 def _read_npz(path: Path) -> Dict[str, np.ndarray]:
     with np.load(path, allow_pickle=True) as z:
         return {k: z[k] for k in z.files}
 
-
-def _list_images(images_dir: Path) -> List[Path]:
-    if not images_dir.exists():
-        return []
-    return sorted([p for p in images_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
-
-
-def _index_to_filename(idx: int, images_dir: Path) -> Optional[Path]:
-    candidates = [
-        images_dir / f"{idx:06d}.png",
-        images_dir / f"{idx:05d}.png",
-        images_dir / f"{idx:04d}.png",
-        images_dir / f"frame_{idx:06d}.png",
-        images_dir / f"frame_{idx:05d}.png",
-        images_dir / f"frame_{idx:04d}.png",
-        images_dir / f"img_{idx:06d}.png",
-        images_dir / f"img_{idx:05d}.png",
-        images_dir / f"img_{idx:04d}.png",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
-
-
 def _ensure_3d(arr: np.ndarray) -> np.ndarray:
+    """If arr is (H,W), make it (1,H,W)."""
+    arr = np.asarray(arr)
     if arr.ndim == 2:
-        return arr[None, ...]
+        arr = arr[None, ...]
     return arr
 
+def _is_str_array(a: np.ndarray) -> bool:
+    return isinstance(a, np.ndarray) and a.dtype.kind in ("U", "S", "O")
+
+def _list_images_recursive(root: Path) -> List[Path]:
+    pats = ["**/*.png", "**/*.jpg", "**/*.jpeg"]
+    res: List[Path] = []
+    for pat in pats:
+        res.extend(sorted(root.glob(pat)))
+    return res
+
+def _index_to_filename(idx: int, episode_dir: Path) -> Optional[Path]:
+    """Common STK naming patterns anywhere under episode_dir."""
+    candidates = [
+        f"{idx:06d}.png", f"{idx:05d}.png", f"{idx:04d}.png",
+        f"frame_{idx:06d}.png", f"frame_{idx:05d}.png", f"frame_{idx:04d}.png",
+        f"img_{idx:06d}.png",   f"img_{idx:05d}.png",   f"img_{idx:04d}.png",
+    ]
+    for c in candidates:
+        found = list(episode_dir.rglob(c))
+        if found:
+            return found[0]
+    return None
 
 class DriveEpisode:
     """
-    Container for a single episode:
-      - image_paths: List[Path] length N
-      - track: (N,H,W) uint8 in {0,1,2}
-      - depth: (N,H,W) float32 in [0,1] (zeros if missing)
-      - has_depth: bool (True if real depth was loaded)
+    A single episode directory that contains:
+      - info.npz (must exist; keys: frames, track)
+      - optional depth.npz
+      - image files somewhere inside the episode folder
     """
     def __init__(self, episode_dir: Path):
         self.episode_dir = episode_dir
         info_p = episode_dir / "info.npz"
-        images_dir = episode_dir / "images"
-
         if not info_p.exists():
             raise FileNotFoundError(f"Missing info.npz in {episode_dir}")
-        if not images_dir.exists():
-            raise FileNotFoundError(f"Missing images/ folder in {episode_dir}")
 
         info = _read_npz(info_p)
-
         frames = info.get("frames", None)
         if frames is None:
             raise KeyError(f"'frames' not found in {info_p}")
@@ -97,88 +89,105 @@ class DriveEpisode:
         track = info.get("track", None)
         if track is None:
             raise KeyError(f"'track' not found in {info_p}")
-        track = _ensure_3d(np.asarray(track))  # (N,H,W)
-        track = track.astype(np.uint8, copy=False)
+        track = np.asarray(track)
+        track = _ensure_3d(track).astype(np.uint8, copy=False)  # (N_t,H,W) or (1,H,W)
 
-        # depth: tolerant load; make dummy if absent
+        # Resolve image paths
+        self.image_paths: List[Path] = []
+        if _is_str_array(frames):
+            # Treat as paths; resolve relative to episode_dir
+            for f in frames:
+                rel = str(f)
+                p = (episode_dir / rel) if not rel.startswith("/") else Path(rel)
+                if not p.exists():
+                    # try to find by filename anywhere under episode_dir
+                    cand = list(episode_dir.rglob(Path(rel).name))
+                    if not cand:
+                        raise FileNotFoundError(f"Image path from frames not found: {rel} in {episode_dir}")
+                    p = cand[0]
+                self.image_paths.append(p)
+        else:
+            # Assume integer indices -> try to map indices to real files
+            # First, scan all images in the episode recursively
+            all_imgs = _list_images_recursive(episode_dir)
+            if not all_imgs:
+                # try common subfolder names if recursive somehow blocked
+                for sub in ("images", "rgb", "frames"):
+                    all_imgs = _list_images_recursive(episode_dir / sub)
+                    if all_imgs:
+                        break
+            # If still none, resolve per-index by name patterns
+            if not all_imgs:
+                # Fallback to direct patterns for first 20000 indices (safe upper bound)
+                # but we cannot guess max; require at least some index match
+                # Try to resolve the first 2000 frames
+                for i in range(2000):
+                    p = _index_to_filename(i, episode_dir)
+                    if p is not None:
+                        self.image_paths.append(p)
+                if not self.image_paths:
+                    raise FileNotFoundError(f"No images found under episode {episode_dir}")
+            else:
+                # If we have a full scan, keep it sorted as the sequence
+                self.image_paths = all_imgs
+
+        # Depth — optional
         depth_path = episode_dir / "depth.npz"
         has_depth = depth_path.exists()
         if has_depth:
             depth_npz = _read_npz(depth_path)
-            depth = depth_npz.get("depth")
-            if depth is None:
-                depth = depth_npz.get("depths")  # occasional alt key
+            depth = depth_npz.get("depth") or depth_npz.get("depths")
             if depth is None:
                 has_depth = False
-
         if has_depth:
-            depth = _ensure_3d(np.asarray(depth))  # (N,H,W)
-            depth = depth.astype(np.float32, copy=False)
+            depth = _ensure_3d(np.asarray(depth)).astype(np.float32, copy=False)  # (N_d,H,W)
+        else:
+            # dummy zeros; we will set has_depth flag to 0 so trainer can skip the loss
+            # We'll shape-align after we know frame count.
+            depth = None
+
+        # Frame count is number of images we actually found
+        N_frames = len(self.image_paths)
+        if N_frames == 0:
+            raise FileNotFoundError(f"No image frames resolved in {episode_dir}")
+
+        # Align track to N_frames: if only 1 mask given, tile it
+        if track.shape[0] == 1 and N_frames > 1:
+            track = np.repeat(track, N_frames, axis=0)
+        else:
+            # if track shorter/longer than frames, clip
+            track = track[:N_frames]
+
+        # Align depth similarly
+        if has_depth:
+            if depth.shape[0] == 1 and N_frames > 1:
+                depth = np.repeat(depth, N_frames, axis=0)
+            else:
+                depth = depth[:N_frames]
         else:
             depth = np.zeros_like(track, dtype=np.float32)
 
-        # Build image path list
-        self.image_paths: List[Path] = []
-        N = max(track.shape[0], depth.shape[0])
-
-        if isinstance(frames, np.ndarray) and frames.dtype.kind in ("U", "S", "O"):
-            # frames has file names / relpaths
-            for i in range(len(frames)):
-                rel = str(frames[i])
-                p = (episode_dir / rel) if not rel.startswith("images/") else (episode_dir / rel)
-                if not p.exists():
-                    cand = images_dir / rel
-                    if cand.exists():
-                        p = cand
-                    else:
-                        raise FileNotFoundError(f"Image path from frames not found: {p}")
-                self.image_paths.append(p)
-            N = min(N, len(self.image_paths))
-        else:
-            # integer indices -> try list or pattern-match
-            listed = _list_images(images_dir)
-            if listed and len(listed) >= N:
-                self.image_paths = listed[:N]
-            else:
-                for i in range(N):
-                    p = _index_to_filename(i, images_dir)
-                    if p is None:
-                        raise FileNotFoundError(
-                            f"Could not resolve image filename for index {i} in {images_dir}"
-                        )
-                    self.image_paths.append(p)
-
-        # Align lengths strictly
-        self.N = min(N, track.shape[0], depth.shape[0], len(self.image_paths))
-        self.track = track[: self.N]          # (N,H,W)
-        self.depth = depth[: self.N]          # (N,H,W)
+        self.N = min(N_frames, track.shape[0], depth.shape[0])
+        self.image_paths = self.image_paths[: self.N]
+        self.track = track[: self.N]
+        self.depth = depth[: self.N]
         self.has_depth = bool(has_depth)
 
     def __len__(self) -> int:
         return self.N
 
-
 class DriveDataset(Dataset):
-    """
-    Dataset across episodes for a split (train/val/test).
-    """
     def __init__(self, root_dir: str | Path, split: str = "train", transform_pipeline: Optional[str] = None):
         self.root_dir = Path(root_dir)
         self.split = split
         self.split_dir = self.root_dir / split
-
         if not self.split_dir.exists():
             raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
 
-        # Gather episode dirs
-        episode_dirs = sorted([p for p in self.split_dir.iterdir() if (p / "info.npz").exists()])
+        # Find episodes that contain info.npz somewhere inside
+        episode_dirs = sorted({p.parent for p in self.split_dir.rglob("info.npz")})
         if not episode_dirs:
-            for p in self.split_dir.rglob("info.npz"):
-                episode_dirs.append(p.parent)
-            episode_dirs = sorted(set(episode_dirs))
-
-        if not episode_dirs:
-            raise FileNotFoundError(f"No episodes found under {self.split_dir}")
+            raise FileNotFoundError(f"No episodes (info.npz) found under {self.split_dir}")
 
         self.episodes: List[DriveEpisode] = []
         for ep in episode_dirs:
@@ -190,13 +199,12 @@ class DriveDataset(Dataset):
         if not self.episodes:
             raise RuntimeError(f"All episodes under {self.split_dir} failed to load.")
 
-        # Build global index
+        # Global index
         self.index: List[Tuple[int, int]] = []
-        for ep_idx, ep in enumerate(self.episodes):
-            for fidx in range(len(ep)):
-                self.index.append((ep_idx, fidx))
+        for ei, ep in enumerate(self.episodes):
+            for fi in range(len(ep)):
+                self.index.append((ei, fi))
 
-        # transforms
         self.do_hflip = (split == "train" and transform_pipeline in ("hflip", "flip", "strong"))
         self.normalize = transforms.Normalize(mean=INPUT_MEAN, std=INPUT_STD)
 
@@ -207,30 +215,27 @@ class DriveDataset(Dataset):
         img_path = ep.image_paths[fidx]
         with Image.open(img_path) as im:
             im = im.convert("RGB")
-        depth = ep.depth[fidx]  # (H,W) float32
-        track = ep.track[fidx]  # (H,W) uint8
+        depth = ep.depth[fidx]
+        track = ep.track[fidx]
         return im, depth, track, ep.has_depth
 
     def _apply_transforms(self, im: Image.Image, depth_np: np.ndarray, track_np: np.ndarray):
-        dep_img = Image.fromarray(depth_np.astype(np.float32), mode="F")  # continuous
-        trk_img = Image.fromarray(track_np.astype(np.uint8), mode="L")    # categorical
+        dep_img = Image.fromarray(depth_np.astype(np.float32), mode="F")
+        trk_img = Image.fromarray(track_np.astype(np.uint8), mode="L")
 
         if self.do_hflip and np.random.rand() < 0.5:
-            im = TF.hflip(im)
-            dep_img = TF.hflip(dep_img)
-            trk_img = TF.hflip(trk_img)
+            im = TF.hflip(im); dep_img = TF.hflip(dep_img); trk_img = TF.hflip(trk_img)
 
         H, W = TARGET_HW
-        im = TF.resize(im, size=[H, W], interpolation=transforms.InterpolationMode.BILINEAR)
-        dep_img = TF.resize(dep_img, size=[H, W], interpolation=transforms.InterpolationMode.BILINEAR)
-        trk_img = TF.resize(trk_img, size=[H, W], interpolation=transforms.InterpolationMode.NEAREST)
+        im = TF.resize(im, [H, W], interpolation=transforms.InterpolationMode.BILINEAR)
+        dep_img = TF.resize(dep_img, [H, W], interpolation=transforms.InterpolationMode.BILINEAR)
+        trk_img = TF.resize(trk_img, [H, W], interpolation=transforms.InterpolationMode.NEAREST)
 
         img_t = TF.to_tensor(im)
         img_t = self.normalize(img_t)
 
         depth_t = torch.from_numpy(np.array(dep_img, dtype=np.float32)).clamp_(0.0, 1.0)
         track_t = torch.from_numpy(np.array(trk_img, dtype=np.uint8)).long()
-
         return img_t, depth_t, track_t
 
     def __getitem__(self, idx: int):
@@ -244,7 +249,6 @@ class DriveDataset(Dataset):
             "track": track_t,
             "has_depth": torch.tensor(1 if has_depth else 0, dtype=torch.uint8),
         }
-
 
 def load_data(
     dataset_path: str | Path,
