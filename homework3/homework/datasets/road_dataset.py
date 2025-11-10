@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Optional, List
 import numpy as np
 import torch
+import re
 
 # Use relative imports inside the package
 from . import road_transforms  # and add similar for road_utils if you use it
