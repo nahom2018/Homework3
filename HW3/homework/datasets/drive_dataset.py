@@ -207,39 +207,60 @@ class DriveEpisode:
             raise FileNotFoundError(f"Missing info.npz in {episode_dir}")
         info = _read_npz(info_p)
 
+        # ---- FRAMES (unwrap 0-D array -> list) ----
         frames = info.get("frames", None)
         if frames is None:
             raise KeyError(f"'frames' not found in {info_p}")
 
-        # --- Parse track robustly ---
+        # If saved as a 0-D object array, unwrap to a Python scalar
+        if isinstance(frames, np.ndarray) and frames.ndim == 0:
+            frames = frames.item()
+
+        # If scalar (str/int), make it a list; otherwise keep as-is
+        if not isinstance(frames, (list, tuple, np.ndarray)):
+            frames = [frames]
+        else:
+            # ensure list for downstream iteration
+            frames = list(frames)
+
+        # ---- TRACK (unwrap 0-D array -> parse robustly) ----
         raw_track = info.get("track", None)
         if raw_track is None:
             raise KeyError(f"'track' not found in {info_p}")
 
+        # If saved as a 0-D object array, unwrap to Python object
+        if isinstance(raw_track, np.ndarray) and raw_track.ndim == 0:
+            raw_track = raw_track.item()
+
+        # Try the simple numeric case first; if it fails, parse object/dict/list
         try:
-            # Simple numeric case
-            track = _ensure_3d_numeric(np.asarray(raw_track, dtype=np.uint8))
+            track = _ensure_3d_numeric(np.asarray(raw_track, dtype=np.uint8))  # (N_t,H,W) or (1,H,W)
         except (TypeError, ValueError):
-            # Object/dict/list cases
-            track = _extract_track_from_object_array(raw_track, episode_dir, split_dir, root_dir)
-        # track now (N_t,H,W) uint8
-        # sanitize label values to 0/1/2
+            # object arrays, dicts, lists, filepaths -> extract per-frame masks
+            track = _extract_track_from_object_array(raw_track, self.episode_dir, self.split_dir, self.root_dir)
+
+        # sanitize labels to {0,1,2}
         if track.dtype != np.uint8:
             track = track.astype(np.int64, copy=False)
         uniq = np.unique(track)
-        if not set(uniq.tolist()).issubset({0,1,2}):
+        if not set(uniq.tolist()).issubset({0, 1, 2}):
             track = np.array([_coerce_mask_values_to_012(t) for t in track], dtype=np.uint8)
 
-        # --- Resolve image paths ---
-        self.image_paths: List[Path] = []
-        if _is_str_array(frames):
-            for f in (list(frames) if not isinstance(frames, list) else frames):
+        # ---- Resolve image paths from 'frames' (filenames or indices) ----
+        self.image_paths = []
+
+        def _frames_all_strings(seq):
+            return len(seq) > 0 and isinstance(seq[0], (str, bytes))
+
+        if _frames_all_strings(frames):
+            # Treat entries as paths; resolve relative to episode/split/root
+            for f in frames:
                 p = _resolve_frame_path(str(f), self.episode_dir, self.split_dir, self.root_dir)
                 if p is None or not p.exists():
                     raise FileNotFoundError(f"Frame path not found: {f} in {self.episode_dir}")
                 self.image_paths.append(p)
         else:
-            # numeric indices -> prefer recursive listing; else patterns anywhere
+            # Not strings -> assume indices; prefer recursive listing; else pattern match
             all_imgs = _glob_images(self.episode_dir)
             if not all_imgs:
                 for sub in ("images", "rgb", "frames"):
@@ -249,23 +270,33 @@ class DriveEpisode:
             if all_imgs:
                 self.image_paths = all_imgs
             else:
-                for i in range(20000):
-                    p = _index_to_filename_anywhere(i, self.episode_dir)
+                # final fallback: resolve indices anywhere under episode by common patterns
+                # if frames is a single int, just try to resolve that one; else try a generous range
+                indices = frames
+                try:
+                    # convert to ints if possible
+                    indices = [int(x) for x in frames]
+                except Exception:
+                    # unknown type -> probe a default range
+                    indices = list(range(20000))
+                for i in indices:
+                    p = _index_to_filename_anywhere(int(i), self.episode_dir)
                     if p: self.image_paths.append(p)
                 if not self.image_paths:
                     raise FileNotFoundError(f"No images found in episode {self.episode_dir}")
 
+        # ---- Continue with alignment (rest of your method stays the same) ----
         N_frames = len(self.image_paths)
         if N_frames == 0:
             raise FileNotFoundError(f"No image frames resolved in {self.episode_dir}")
 
-        # Align track frames
+        # Align track to number of frames
         if track.shape[0] == 1 and N_frames > 1:
             track = np.repeat(track, N_frames, axis=0)
         else:
             track = track[:N_frames]
 
-        # --- Depth (optional) ---
+        # Depth (optional): same logic you already have
         depth_path = episode_dir / "depth.npz"
         has_depth = depth_path.exists()
         if has_depth:
