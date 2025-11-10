@@ -32,6 +32,7 @@ class RoadDataset(torch.utils.data.Dataset):
         info = np.load(str(info_path), allow_pickle=True)
         self.info = info
         files = getattr(info, "files", [])
+        self.frames_meta = {k: self.info[k] for k in files}  # dict of arrays
 
         # Extract per-episode track masks if present
         self.track = info["track"] if ("track" in files) else None
@@ -120,10 +121,9 @@ class RoadDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         frame_id = int(self.indices[idx])
-        # Satisfy both single-frame and multi-frame loaders
         sample = {
-            "_idx": frame_id,  # for ImageLoader expecting 00000_im.jpg
-            "_frames": [frame_id],  # for any sequence/stack loader expecting a list
+            "_idx": frame_id,  # for file-based loaders (e.g., 00000_im.jpg)
+            "_frames": self.frames_meta  # dict used by transforms (e.g., distance_down_track)
         }
         return self.transform(sample)
 
