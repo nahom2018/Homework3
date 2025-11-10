@@ -171,7 +171,7 @@ class RoadDataset(torch.utils.data.Dataset):
             "_idx": frame_id,  # for file-based loaders (e.g., 00000_im.jpg)
             "_frames": self.frames_meta  # dict with arrays like 'distance_down_track'
         }
-        return self.transform(sample)
+        return self.get_transform(sample)
 
 
 # ===================== Data loading =====================
