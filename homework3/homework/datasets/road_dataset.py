@@ -8,6 +8,31 @@ import re
 # Use relative imports inside the package
 from . import road_transforms  # and add similar for road_utils if you use it
 
+def _extract_frames_meta(frames_obj):
+    """
+    Unpack 'frames' from info.npz into a plain dict[str, np.ndarray].
+    Handles 0-d object arrays, structured arrays, or dicts.
+    """
+
+
+    # 0-d object array that stores a dict
+    if isinstance(frames_obj, _np.ndarray) and frames_obj.dtype == object and frames_obj.shape == ():
+        inner = frames_obj.item()
+        return dict(inner)
+
+    # Already a dict
+    if isinstance(frames_obj, dict):
+        return dict(frames_obj)
+
+    # Structured/record array
+    if isinstance(frames_obj, _np.ndarray) and frames_obj.dtype.names:
+        return {name: frames_obj[name] for name in frames_obj.dtype.names}
+
+    # Fallback: wrap as a single array (indexable at least)
+    if isinstance(frames_obj, _np.ndarray):
+        return {"_array": frames_obj}
+
+    return {}
 
 # ===================== Dataset =====================
 
@@ -29,53 +54,75 @@ class RoadDataset(torch.utils.data.Dataset):
         if not info_path.exists():
             raise FileNotFoundError(f"Missing info.npz at {info_path}")
 
-        info = np.load(str(self.episode_path / "info.npz"), allow_pickle=True)
+        info = np.load(str(info_path), allow_pickle=True)
         self.info = info
         files = getattr(info, "files", [])
+
+        # --- masks ---
         self.track = info["track"] if ("track" in files) else None
         self.has_masks = self.track is not None
-        self.frames_meta = {k: info[k] for k in files}
 
-        # If masks required (val/test), enforce presence
-        if not self.allow_missing_masks and not self.has_masks:
-            raise FileNotFoundError(f"No 'track' masks in {info_path} but masks are required for this split.")
-
-        # Build transform (define AFTER has_masks is known)
-        self.transform = self.get_transform("default" if transform_pipeline is None else transform_pipeline)
-
-
-        # ---- Frame index bookkeeping ----
-
-
-        # 1) Try common frame subdirectories
-        files = getattr(self.info, "files", [])
-        root = self.episode_path
-        pattern = re.compile(r"^(\d{1,})_im\.(jpg|png|jpeg)$", re.IGNORECASE)
-
-        # 1) Prefer explicit indices in info.npz
-        if "indices" in files:
-            self.indices = [int(x) for x in list(self.info["indices"])]
-
-        # 2) Prefer root files matching * _im.jpg
+        # --- unpack frames -> dict of arrays (expects keys like 'distance_down_track') ---
+        if "frames" in files:
+            self.frames_meta = _extract_frames_meta(info["frames"])
         else:
-            root_frames = sorted([p for p in root.iterdir() if p.is_file() and pattern.match(p.name)])
-            if root_frames:
-                # Extract the number portion before '_im'
-                self.indices = [int(pattern.match(p.name).group(1)) for p in root_frames]
-            # 3) Fallbacks
-            elif "length" in files:
-                self.indices = list(range(int(self.info["length"])))
-            elif "n" in files:
-                self.indices = list(range(int(self.info["n"])))
-            elif "num_frames" in files:
-                self.indices = list(range(int(self.info["num_frames"])))
+            self.frames_meta = {}
+
+        # ---- choose indices using frames_meta first; fallback to files on disk ----
+        def _len_of_any_array(d):
+            for v in d.values():
+                try:
+                    return len(v)
+                except Exception:
+                    pass
+            return None
+
+        N = _len_of_any_array(self.frames_meta)
+        if N is not None and N > 0:
+            # frames arrays define the timeline; use simple 0..N-1
+            self.indices = list(range(N))
+        else:
+            # Fallback: discover frames by filenames
+            import re
+            exts = {".png", ".jpg", ".jpeg"}
+
+            # Prefer files like 00000_im.jpg in the episode root
+            pattern = re.compile(r"^(\d{1,})_im\.(jpg|png|jpeg)$", re.IGNORECASE)
+            root_files = sorted([p for p in self.episode_path.iterdir() if p.is_file()])
+            match_files = [p for p in root_files if p.suffix.lower() in exts and pattern.match(p.name)]
+
+            if match_files:
+                self.indices = [int(pattern.match(p.name).group(1)) for p in match_files]
             else:
-                present_files = [p.name for p in root.iterdir() if p.is_file()]
-                raise RuntimeError(
-                    f"Could not infer frame indices for {self.episode_path}.\n"
-                    f"Looked for files like 00000_im.jpg in the episode root. Found files: {present_files}\n"
-                    f"Also checked 'indices'/'length'/'n'/'num_frames' in info.npz."
-                )
+                # Try common subdirs
+                candidate_dirs = ["image", "images", "rgb", "imgs", "color"]
+                frame_dir = next((self.episode_path / d for d in candidate_dirs
+                                  if (self.episode_path / d).exists() and (self.episode_path / d).is_dir()), None)
+                if frame_dir is not None:
+                    frame_files = sorted([p for p in frame_dir.iterdir()
+                                          if p.is_file() and p.suffix.lower() in exts])
+                    if not frame_files:
+                        raise FileNotFoundError(f"No frame files found in {frame_dir}")
+                    # Try numeric stems; otherwise enumerate
+                    try:
+                        self.indices = [int(p.stem) for p in frame_files]
+                    except ValueError:
+                        self.indices = list(range(len(frame_files)))
+                else:
+                    # Last resort, look for length-like keys in info.npz
+                    for k in ("length", "n", "num_frames"):
+                        if k in files:
+                            self.indices = list(range(int(info[k])))
+                            break
+                    else:
+                        present_dirs = [p.name for p in self.episode_path.iterdir() if p.is_dir()]
+                        present_files = [p.name for p in self.episode_path.iterdir() if p.is_file()]
+                        raise RuntimeError(
+                            f"Could not infer frame indices for episode {self.episode_path}.\n"
+                            f"Looked for 'frames' arrays, files like 00000_im.jpg, common subdirs {candidate_dirs} "
+                            f"(found dirs: {present_dirs}), and 'length'/'n'/'num_frames' in info.npz.\n"
+                            f"Found files: {present_files}"
+                        )
 
         self.length = len(self.indices)
 
@@ -120,8 +167,8 @@ class RoadDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         frame_id = int(self.indices[idx])
         sample = {
-            "_idx": frame_id,  # for ImageLoader -> 00000_im.jpg
-            "_frames": self.frames_meta  # for transforms that read episode arrays
+            "_idx": frame_id,  # for file-based loaders (e.g., 00000_im.jpg)
+            "_frames": self.frames_meta  # dict with arrays like 'distance_down_track'
         }
         return self.transform(sample)
 
