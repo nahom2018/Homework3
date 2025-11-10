@@ -45,46 +45,24 @@ class RoadDataset(torch.utils.data.Dataset):
 
 
         # ---- Frame index bookkeeping ----
+
+
         # 1) Try common frame subdirectories
-        candidate_dirs = ["image", "images", "rgb", "imgs", "color"]
-        frame_dir = None
-        for dname in candidate_dirs:
-            dpath = self.episode_path / dname
-            if dpath.exists() and dpath.is_dir():
-                frame_dir = dpath
-                break
-
-        exts = {".png", ".jpg", ".jpeg"}
         files = getattr(self.info, "files", [])
+        root = self.episode_path
+        pattern = re.compile(r"^(\d{1,})_im\.(jpg|png|jpeg)$", re.IGNORECASE)
 
-        def _frames_in_dir(d):
-            return sorted([p for p in d.iterdir() if p.is_file() and p.suffix.lower() in exts])
-
-        def _numeric_or_enumerate(paths):
-            # Prefer numeric stems if possible; else 0..N-1
-            try:
-                return [int(p.stem) for p in paths]
-            except ValueError:
-                return list(range(len(paths)))
-
-        # Priority:
-        # A) explicit indices in info.npz
+        # 1) Prefer explicit indices in info.npz
         if "indices" in files:
             self.indices = [int(x) for x in list(self.info["indices"])]
 
-        # B) frames under a known subdir
-        elif frame_dir is not None:
-            frame_files = _frames_in_dir(frame_dir)
-            if not frame_files:
-                raise FileNotFoundError(f"No frame files found in {frame_dir}")
-            self.indices = _numeric_or_enumerate(frame_files)
-
-        # C) frames directly in the EPISODE ROOT (no subfolders)
+        # 2) Prefer root files matching * _im.jpg
         else:
-            root_frames = _frames_in_dir(self.episode_path)
+            root_frames = sorted([p for p in root.iterdir() if p.is_file() and pattern.match(p.name)])
             if root_frames:
-                self.indices = _numeric_or_enumerate(root_frames)
-            # D) fallback to length-like fields in info.npz
+                # Extract the number portion before '_im'
+                self.indices = [int(pattern.match(p.name).group(1)) for p in root_frames]
+            # 3) Fallbacks
             elif "length" in files:
                 self.indices = list(range(int(self.info["length"])))
             elif "n" in files:
@@ -92,12 +70,10 @@ class RoadDataset(torch.utils.data.Dataset):
             elif "num_frames" in files:
                 self.indices = list(range(int(self.info["num_frames"])))
             else:
-                present_dirs = [p.name for p in self.episode_path.iterdir() if p.is_dir()]
-                present_files = [p.name for p in self.episode_path.iterdir() if p.is_file()]
+                present_files = [p.name for p in root.iterdir() if p.is_file()]
                 raise RuntimeError(
-                    f"Could not infer frame indices for episode {self.episode_path}.\n"
-                    f"Looked for subdirs {candidate_dirs} (found dirs: {present_dirs}), "
-                    f"then tried root images (found files: {present_files}).\n"
+                    f"Could not infer frame indices for {self.episode_path}.\n"
+                    f"Looked for files like 00000_im.jpg in the episode root. Found files: {present_files}\n"
                     f"Also checked 'indices'/'length'/'n'/'num_frames' in info.npz."
                 )
 
