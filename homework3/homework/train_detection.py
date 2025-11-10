@@ -12,7 +12,7 @@ from homework.models import Detector, save_model as save_for_grader
 # Prefer the correct loader from road_dataset
 load_data = None
 try:
-    from homework.datasets.road_dataset import load_data as load_data
+    from homework.datasets.classification_dataset import load_data as load_data
 except Exception:
     try:
         from homework.road_dataset import load_data as load_data
