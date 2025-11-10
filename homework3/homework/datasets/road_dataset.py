@@ -114,4 +114,4 @@ def load_data(dataset_path, batch_size=32, num_workers=2, transform_pipeline=Non
             pin_memory=True,
         )
 
-    return loaders["train"], loaders["val"], loaders["test"]
+    return loaders["train"], loaders["val"]
