@@ -72,46 +72,68 @@ class RoadDataset(Dataset):
         return sample
 
 
+def _collect_episode_dirs(split_dir: Path):
+    if not split_dir.exists():
+        return []
+    return sorted(
+        p for p in split_dir.iterdir()
+        if p.is_dir() and (p / "info.npz").exists()
+    )
+
 def load_data(dataset_path, batch_size=32, num_workers=2, transform_pipeline=None,
-              allow_missing_masks=False):
-    """
-    Build DataLoaders for train/val/test by concatenating per-episode datasets.
-    Each episode directory must contain an info.npz file.
-    """
+              allow_missing_masks=False, seed: int = 1337):
     dataset_path = Path(dataset_path)
-    loaders = {}
+    train_dir = dataset_path / "train"
+    val_dir   = dataset_path / "val"
+    test_dir  = dataset_path / "test"
 
-    for split in ["train", "val", "test"]:
-        split_dir = dataset_path / split
-
-        # Collect episode directories (those that contain info.npz)
-        episode_dirs = sorted(
-            p for p in split_dir.iterdir()
-            if p.is_dir() and (p / "info.npz").exists()
+    if not train_dir.exists():
+        raise FileNotFoundError(
+            f"Missing required directory: {train_dir}\n"
+            f"Expected: drive_data/train/<episode>/info.npz"
         )
-        if not episode_dirs:
-            raise FileNotFoundError(
-                f"No episodes with info.npz found under: {split_dir}\n"
-                f"Expected structure like: {split_dir}/<episode>/info.npz"
-            )
 
-        # Build a RoadDataset per episode, then concat
+    train_eps = _collect_episode_dirs(train_dir)
+    val_eps   = _collect_episode_dirs(val_dir)
+    test_eps  = _collect_episode_dirs(test_dir)
+
+    if not train_eps:
+        raise FileNotFoundError(f"No episodes with info.npz under {train_dir}")
+
+    # If val is missing, carve 80/20 from train
+    if not val_eps:
+        rng = np.random.RandomState(seed)
+        idx = np.arange(len(train_eps))
+        rng.shuffle(idx)
+        n_train = max(1, int(0.8 * len(idx)))
+        val_eps = [train_eps[i] for i in idx[n_train:] or idx[-1:]]
+        train_eps = [train_eps[i] for i in idx[:n_train]]
+
+    # If test missing, reuse val
+    if not test_eps:
+        test_eps = val_eps
+
+    def _make_loader(episode_dirs, split_name: str):
         per_episode = [
             RoadDataset(
-                p,
-                transform_pipeline=transform_pipeline,
-                allow_missing_masks=allow_missing_masks
+                ep,
+                # If caller didn’t specify, use aug for train, default for others
+                transform_pipeline=("aug" if (transform_pipeline is None and split_name == "train") else
+                                    ("default" if transform_pipeline is None else transform_pipeline)),
+                allow_missing_masks=allow_missing_masks,
             )
-            for p in episode_dirs
+            for ep in episode_dirs
         ]
         concat = torch.utils.data.ConcatDataset(per_episode)
-
-        loaders[split] = torch.utils.data.DataLoader(
+        return torch.utils.data.DataLoader(
             concat,
             batch_size=batch_size,
-            shuffle=(split == "train"),
+            shuffle=(split_name == "train"),
             num_workers=num_workers,
             pin_memory=True,
         )
 
-    return loaders["train"], loaders["val"]
+    train_loader = _make_loader(train_eps, "train")
+    val_loader   = _make_loader(val_eps,   "val")
+    test_loader  = _make_loader(test_eps,  "test")
+    return train_loader, val_loader, test_loader
