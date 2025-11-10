@@ -44,28 +44,51 @@ class RoadDataset(torch.utils.data.Dataset):
         self.transform = self.get_transform("default" if transform_pipeline is None else transform_pipeline)
 
         # ---- Frame index bookkeeping ----
-        img_dir = self.episode_path / "image"
+        candidate_dirs = ["image", "images", "rgb", "imgs", "color"]
+        frame_dir = None
+        for dname in candidate_dirs:
+            dpath = self.episode_path / dname
+            if dpath.exists() and dpath.is_dir():
+                frame_dir = dpath
+                break
+
         exts = {".png", ".jpg", ".jpeg"}
 
-        if "indices" in files:  # explicit indices in info.npz
-            self.indices: List[int] = [int(x) for x in list(self.info["indices"])]
-        elif img_dir.exists():
-            frame_files = sorted(p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+        files = getattr(self.info, "files", [])
+        # 1) Explicit indices in info.npz (if provided)
+        if "indices" in files:
+            self.indices = [int(x) for x in list(self.info["indices"])]
+        # 2) Infer from a discovered frame directory (any of image/images/rgb/imgs/color)
+        elif frame_dir is not None:
+            frame_files = sorted(
+                [p for p in frame_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+            )
             if not frame_files:
-                raise FileNotFoundError(f"No frames found in {img_dir}")
-            try:
-                self.indices = [int(p.stem) for p in frame_files]  # numeric stems like 000.png
-            except ValueError:
-                # fallback to range if stems are not numeric
-                self.indices = list(range(len(frame_files)))
+                raise FileNotFoundError(f"No frame files found in {frame_dir}")
+            # Prefer numeric stems if available; otherwise enumerate
+            numeric_ok = True
+            stems = []
+            for p in frame_files:
+                try:
+                    stems.append(int(p.stem))
+                except ValueError:
+                    numeric_ok = False
+                    break
+            self.indices = stems if numeric_ok else list(range(len(frame_files)))
+        # 3) Fall back to length-like fields in info.npz
         elif "length" in files:
             self.indices = list(range(int(self.info["length"])))
         elif "n" in files:
             self.indices = list(range(int(self.info["n"])))
+        elif "num_frames" in files:
+            self.indices = list(range(int(self.info["num_frames"])))
         else:
+            # Better error with context
+            present = [p.name for p in self.episode_path.iterdir() if p.is_dir()]
             raise RuntimeError(
-                f"Could not infer frame indices for episode {self.episode_path}. "
-                f"Expected 'image/' folder or 'indices'/'length'/'n' in info.npz."
+                f"Could not infer frame indices for episode {self.episode_path}.\n"
+                f"Looked for dirs {candidate_dirs} (found: {present}) or one of "
+                f"'indices'/'length'/'n'/'num_frames' in info.npz."
             )
 
         self.length = len(self.indices)
