@@ -143,7 +143,8 @@ class RoadDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         frame_id = int(self.indices[idx])
-        sample = {"index": frame_id}
+        # road_transforms.ImageLoader expects '_idx' for naming like 00000_im.jpg
+        sample = {"_idx": frame_id}
         return self.transform(sample)
 
 
