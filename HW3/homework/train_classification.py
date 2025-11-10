@@ -1,5 +1,5 @@
 import argparse, time, torch, torch.nn as nn, torch.optim as optim
-from models import load_model
+from homework.models import load_model
 from classification_dataset import load_data
 
 def accuracy(logits, y):
