@@ -1,13 +1,47 @@
 import argparse, time, torch, torch.nn as nn, torch.optim as optim
 from homework.models import load_model
+import sys, importlib, importlib.util
+from pathlib import Path
 
 def import_drive_loader():
-    for name in ["homework.datasets.drive_dataset","homework.datasets.road_dataset"]:
+
+    here = Path(__file__).resolve()
+    sys.path.insert(0, str(here.parent))              # .../homework
+    sys.path.insert(0, str(here.parent.parent))       # .../HW3
+
+    candidates = [
+        "homework.datasets.drive_dataset",
+        "homework.datasets.road_dataset",
+        "drive_dataset",
+        "road_dataset",
+    ]
+    last_err = None
+    for modname in candidates:
         try:
-            mod=__import__(name)
-            if hasattr(mod,"load_data"): return mod.load_data
-        except Exception: continue
-    raise ImportError("Could not find drive_dataset.py or road_dataset.py")
+            m = importlib.import_module(modname)
+            if hasattr(m, "load_data"):
+                return getattr(m, "load_data")
+        except Exception as e:
+            last_err = e
+
+    # Fallback: directly load from file paths if modules aren't importable
+    search_places = [
+        here.parent,                                  # .../homework
+        here.parent / "datasets",                     # .../homework/datasets
+        here.parent.parent,                           # .../HW3
+        here.parent.parent / "homework" / "datasets", # .../HW3/homework/datasets
+    ]
+    for fname in ("drive_dataset.py", "road_dataset.py"):
+        for base in search_places:
+            p = (base / fname)
+            if p.exists():
+                spec = importlib.util.spec_from_file_location("dyn_ds", p)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+                if hasattr(mod, "load_data"):
+                    return mod.load_data
+
+    raise ImportError(f"Could not find drive_dataset.py or road_dataset.py. Last error: {last_err}")
 
 def iou_from_logits(logits,y_true,num_classes=3):
     preds=logits.argmax(1);ious=[]
