@@ -29,14 +29,12 @@ class RoadDataset(torch.utils.data.Dataset):
         if not info_path.exists():
             raise FileNotFoundError(f"Missing info.npz at {info_path}")
 
-        info = np.load(str(info_path), allow_pickle=True)
+        info = np.load(str(self.episode_path / "info.npz"), allow_pickle=True)
         self.info = info
         files = getattr(info, "files", [])
-        self.frames_meta = {k: self.info[k] for k in files}  # dict of arrays
-
-        # Extract per-episode track masks if present
         self.track = info["track"] if ("track" in files) else None
         self.has_masks = self.track is not None
+        self.frames_meta = {k: info[k] for k in files}
 
         # If masks required (val/test), enforce presence
         if not self.allow_missing_masks and not self.has_masks:
@@ -122,8 +120,8 @@ class RoadDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         frame_id = int(self.indices[idx])
         sample = {
-            "_idx": frame_id,  # for file-based loaders (e.g., 00000_im.jpg)
-            "_frames": self.frames_meta  # dict used by transforms (e.g., distance_down_track)
+            "_idx": frame_id,  # for ImageLoader -> 00000_im.jpg
+            "_frames": self.frames_meta  # for transforms that read episode arrays
         }
         return self.transform(sample)
 
