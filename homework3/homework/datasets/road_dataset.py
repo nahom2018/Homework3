@@ -43,7 +43,9 @@ class RoadDataset(torch.utils.data.Dataset):
         # Build transform (define AFTER has_masks is known)
         self.transform = self.get_transform("default" if transform_pipeline is None else transform_pipeline)
 
+
         # ---- Frame index bookkeeping ----
+        # 1) Try common frame subdirectories
         candidate_dirs = ["image", "images", "rgb", "imgs", "color"]
         frame_dir = None
         for dname in candidate_dirs:
@@ -53,43 +55,51 @@ class RoadDataset(torch.utils.data.Dataset):
                 break
 
         exts = {".png", ".jpg", ".jpeg"}
-
         files = getattr(self.info, "files", [])
-        # 1) Explicit indices in info.npz (if provided)
+
+        def _frames_in_dir(d):
+            return sorted([p for p in d.iterdir() if p.is_file() and p.suffix.lower() in exts])
+
+        def _numeric_or_enumerate(paths):
+            # Prefer numeric stems if possible; else 0..N-1
+            try:
+                return [int(p.stem) for p in paths]
+            except ValueError:
+                return list(range(len(paths)))
+
+        # Priority:
+        # A) explicit indices in info.npz
         if "indices" in files:
             self.indices = [int(x) for x in list(self.info["indices"])]
-        # 2) Infer from a discovered frame directory (any of image/images/rgb/imgs/color)
+
+        # B) frames under a known subdir
         elif frame_dir is not None:
-            frame_files = sorted(
-                [p for p in frame_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
-            )
+            frame_files = _frames_in_dir(frame_dir)
             if not frame_files:
                 raise FileNotFoundError(f"No frame files found in {frame_dir}")
-            # Prefer numeric stems if available; otherwise enumerate
-            numeric_ok = True
-            stems = []
-            for p in frame_files:
-                try:
-                    stems.append(int(p.stem))
-                except ValueError:
-                    numeric_ok = False
-                    break
-            self.indices = stems if numeric_ok else list(range(len(frame_files)))
-        # 3) Fall back to length-like fields in info.npz
-        elif "length" in files:
-            self.indices = list(range(int(self.info["length"])))
-        elif "n" in files:
-            self.indices = list(range(int(self.info["n"])))
-        elif "num_frames" in files:
-            self.indices = list(range(int(self.info["num_frames"])))
+            self.indices = _numeric_or_enumerate(frame_files)
+
+        # C) frames directly in the EPISODE ROOT (no subfolders)
         else:
-            # Better error with context
-            present = [p.name for p in self.episode_path.iterdir() if p.is_dir()]
-            raise RuntimeError(
-                f"Could not infer frame indices for episode {self.episode_path}.\n"
-                f"Looked for dirs {candidate_dirs} (found: {present}) or one of "
-                f"'indices'/'length'/'n'/'num_frames' in info.npz."
-            )
+            root_frames = _frames_in_dir(self.episode_path)
+            if root_frames:
+                self.indices = _numeric_or_enumerate(root_frames)
+            # D) fallback to length-like fields in info.npz
+            elif "length" in files:
+                self.indices = list(range(int(self.info["length"])))
+            elif "n" in files:
+                self.indices = list(range(int(self.info["n"])))
+            elif "num_frames" in files:
+                self.indices = list(range(int(self.info["num_frames"])))
+            else:
+                present_dirs = [p.name for p in self.episode_path.iterdir() if p.is_dir()]
+                present_files = [p.name for p in self.episode_path.iterdir() if p.is_file()]
+                raise RuntimeError(
+                    f"Could not infer frame indices for episode {self.episode_path}.\n"
+                    f"Looked for subdirs {candidate_dirs} (found dirs: {present_dirs}), "
+                    f"then tried root images (found files: {present_files}).\n"
+                    f"Also checked 'indices'/'length'/'n'/'num_frames' in info.npz."
+                )
 
         self.length = len(self.indices)
 
