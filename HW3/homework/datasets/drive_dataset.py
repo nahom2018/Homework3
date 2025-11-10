@@ -1,255 +1,294 @@
-# homework/train_detection.py
-import argparse, os, math
-from datetime import datetime
+
+
+from __future__ import annotations
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader  # noqa: F401
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+from torchvision import transforms
 
-from homework.models import Detector, save_model as save_for_grader
+# Normalization used in README / rest of homework
+INPUT_MEAN = [0.2788, 0.2657, 0.2629]
+INPUT_STD  = [0.2064, 0.1944, 0.2252]
 
-# --- Use the CORRECT dataset loader (README typo) ---
-# Prefer datasets/road_dataset.py; keep fallbacks just in case.
-load_road_data = None
-try:
-    from homework.datasets.road_dataset import load_data as load_road_data
-except Exception:
-    try:
-        from homework.road_dataset import load_data as load_road_data
-    except Exception:
-        load_road_data = None
+# Target size for the drive dataset per README
+TARGET_HW = (96, 128)  # (H, W)
 
 
-def save_checkpoint(model, out_dir="logs", prefix="detector"):
-    os.makedirs(out_dir, exist_ok=True)
-    ts = datetime.now().strftime("%m%d_%H%M%S")
-    path = os.path.join(out_dir, f"{prefix}_{ts}.th")
-    torch.save({"model_state": model.state_dict()}, path)
-    return path
+def _read_npz(path: Path) -> Dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=True) as z:
+        return {k: z[k] for k in z.files}
 
 
-@torch.no_grad()
-def compute_mean_iou(preds, targets, num_classes=3):
+def _list_images(images_dir: Path) -> List[Path]:
+    if not images_dir.exists():
+        return []
+    return sorted([p for p in images_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+
+
+def _index_to_filename(idx: int, images_dir: Path) -> Optional[Path]:
     """
-    preds:   (B,H,W) int
-    targets: (B,H,W) int
+    Try a few common SuperTuxKart filename patterns.
+    Returns a valid path or None if none match.
     """
-    iou_sum, count = 0.0, 0
-    for cls in range(num_classes):
-        pred_cls = (preds == cls)
-        tgt_cls = (targets == cls)
-        inter = (pred_cls & tgt_cls).sum().item()
-        union = (pred_cls | tgt_cls).sum().item()
-        if union > 0:
-            iou_sum += inter / union
-            count += 1
-    return (iou_sum / count) if count > 0 else float("nan")
-
-
-# ---------- Batch helpers (tolerate different key names) ----------
-def get_seg(batch):
-    # common names: "track", "seg", "mask", "labels"
-    for k in ("track", "seg", "mask", "labels"):
-        if k in batch:
-            return batch[k]
+    candidates = [
+        images_dir / f"{idx:06d}.png",
+        images_dir / f"{idx:05d}.png",
+        images_dir / f"{idx:04d}.png",
+        images_dir / f"frame_{idx:06d}.png",
+        images_dir / f"frame_{idx:05d}.png",
+        images_dir / f"frame_{idx:04d}.png",
+        images_dir / f"img_{idx:06d}.png",
+        images_dir / f"img_{idx:05d}.png",
+        images_dir / f"img_{idx:04d}.png",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
     return None
 
-def get_depth(batch):
-    # common names: "depth", "depths"
-    for k in ("depth", "depths"):
-        if k in batch:
-            return batch[k]
-    return None
-# ------------------------------------------------------------------
+
+def _ensure_3d(arr: np.ndarray) -> np.ndarray:
+    """
+    If arr is (H,W), expand to (1,H,W). If already (N,H,W), return as-is.
+    """
+    if arr.ndim == 2:
+        return arr[None, ...]
+    return arr
 
 
-def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, have_masks=True):
-    model.train()
-    ce = nn.CrossEntropyLoss()
-    l1 = nn.L1Loss()
+class DriveEpisode:
+    """
+    Helper container for a single episode directory.
+    Gathers:
+      - list of frame image paths (List[Path]) length N
+      - track masks: np.ndarray (N, H, W) with {0,1,2}
+      - depth maps: np.ndarray (N, H, W) in [0,1]
+    """
+    def __init__(self, episode_dir: Path):
+        self.episode_dir = episode_dir
+        info_p = episode_dir / "info.npz"
+        depth_p = episode_dir / "depth.npz"
+        images_dir = episode_dir / "images"
 
-    running_loss, n = 0.0, 0
-    for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)          # (B,3,H,W)
-        y_seg = get_seg(batch)
-        y_depth = get_depth(batch).to(device, non_blocking=True).float()  # (B,H,W)
+        if not info_p.exists():
+            raise FileNotFoundError(f"Missing info.npz in {episode_dir}")
+        if not depth_p.exists():
+            raise FileNotFoundError(f"Missing depth.npz in {episode_dir}")
+        if not images_dir.exists():
+            raise FileNotFoundError(f"Missing images/ folder in {episode_dir}")
 
-        optimizer.zero_grad(set_to_none=True)
-        seg_logits, depth = model(x)                              # seg:(B,3,H,W), depth:(B,1,H,W)
+        info = _read_npz(info_p)
+        depth_npz = _read_npz(depth_p)
 
-        # Depth loss (required)
-        loss_depth = l1(depth, y_depth.unsqueeze(1)) * w_depth
+        # Extract arrays (be defensive about key names / shapes)
+        frames = info.get("frames", None)
+        if frames is None:
+            raise KeyError(f"'frames' not found in {info_p}")
 
-        # Seg loss only if masks exist and weight > 0
-        if have_masks and (y_seg is not None) and w_seg > 0.0:
-            y_seg = y_seg.to(device, non_blocking=True).long()
-            loss_seg = ce(seg_logits, y_seg) * w_seg
+        track = info.get("track", None)
+        if track is None:
+            raise KeyError(f"'track' not found in {info_p}")
+        track = _ensure_3d(np.asarray(track))  # (N,H,W)
+
+        depth = depth_npz.get("depth", None)
+        if depth is None:
+            # occasionally seen as 'depths'
+            depth = depth_npz.get("depths", None)
+        if depth is None:
+            raise KeyError(f"'depth' not found in {depth_p}")
+        depth = _ensure_3d(np.asarray(depth))  # (N,H,W)
+
+        # Build list of image paths aligned with frames length
+        self.image_paths: List[Path] = []
+        N = max(track.shape[0], depth.shape[0])
+
+        # frames can be a list of file names or numeric indices
+        if isinstance(frames, np.ndarray) and frames.dtype.kind in ("U", "S", "O"):
+            # strings/object: treat as relative paths
+            for i in range(len(frames)):
+                # normalize to Path
+                rel = str(frames[i])
+                p = (episode_dir / rel) if not rel.startswith("images/") else (episode_dir / rel)
+                if not p.exists():
+                    # maybe frames hold only the file name under images/
+                    candidate = images_dir / rel
+                    if candidate.exists():
+                        p = candidate
+                    else:
+                        raise FileNotFoundError(f"Image path from frames not found: {p}")
+                self.image_paths.append(p)
+            N = min(N, len(self.image_paths))
         else:
-            loss_seg = torch.zeros((), device=device)
-
-        loss = loss_seg + loss_depth
-        loss.backward()
-        optimizer.step()
-
-        bs = x.size(0)
-        running_loss += loss.item() * bs
-        n += bs
-
-    return running_loss / n
-
-
-@torch.no_grad()
-def evaluate(model, loader, device, num_classes=3, have_masks=True):
-    model.eval()
-    l1 = nn.L1Loss(reduction="mean")
-
-    total_iou = 0.0
-    total_mae = 0.0
-    total_lane_mae = 0.0
-    n = 0
-
-    for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)
-        y_seg = get_seg(batch)
-        y_depth = get_depth(batch).to(device, non_blocking=True).float()
-
-        seg_logits, depth = model(x)
-
-        mae_all = l1(depth, y_depth.unsqueeze(1)).item()
-        total_mae += mae_all * x.size(0)
-
-        if have_masks and (y_seg is not None):
-            y_seg = y_seg.to(device, non_blocking=True).long()
-            preds = seg_logits.argmax(dim=1)  # (B,H,W)
-            miou = compute_mean_iou(preds, y_seg, num_classes=num_classes)
-            if not math.isnan(miou):
-                total_iou += miou * x.size(0)
-
-            abs_err = (depth - y_depth.unsqueeze(1)).abs()  # (B,1,H,W)
-            lane_mask = (y_seg > 0).unsqueeze(1)            # (B,1,H,W)
-            if lane_mask.any():
-                lane_mae = abs_err[lane_mask].mean().item()
+            # assume integer frame indices -> try to resolve to filenames under images/
+            listed = _list_images(images_dir)
+            if listed:
+                # assume natural sort already matches frame order
+                if len(listed) >= N:
+                    self.image_paths = listed[:N]
+                else:
+                    # fallback: try file-per-index resolution
+                    for i in range(N):
+                        p = _index_to_filename(i, images_dir)
+                        if p is None:
+                            raise FileNotFoundError(
+                                f"Could not resolve image filename for index {i} in {images_dir}"
+                            )
+                        self.image_paths.append(p)
             else:
-                lane_mae = float("nan")
-            if not math.isnan(lane_mae):
-                total_lane_mae += lane_mae * x.size(0)
+                # no images found by listing; resolve individually
+                for i in range(N):
+                    p = _index_to_filename(i, images_dir)
+                    if p is None:
+                        raise FileNotFoundError(
+                            f"Could not resolve image filename for index {i} in {images_dir}"
+                        )
+                    self.image_paths.append(p)
 
-        n += x.size(0)
+        # Now align lengths strictly
+        self.N = min(N, track.shape[0], depth.shape[0], len(self.image_paths))
+        self.track = track[: self.N]          # (N,H,W)
+        self.depth = depth[: self.N]          # (N,H,W)
 
-    if n == 0:
-        return float("nan"), float("nan"), float("nan")
-
-    avg_mae = total_mae / n
-    if have_masks:
-        avg_iou = total_iou / n if total_iou > 0 else float("nan")
-        avg_lane_mae = total_lane_mae / n if total_lane_mae > 0 else float("nan")
-        return avg_iou, avg_mae, avg_lane_mae
-    else:
-        return float("nan"), avg_mae, float("nan")
-
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--w_seg", type=float, default=1.0)
-    p.add_argument("--w_depth", type=float, default=1.0)
-    p.add_argument("--save_dir", type=str, default="logs")
-    p.add_argument("--allow_missing_masks", action="store_true",
-                   help="Depth-only mode if loader doesn't supply segmentation labels.")
-    args = p.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    if load_road_data is None:
-        raise RuntimeError(
-            "Could not import load_data from datasets/road_dataset.py. "
-            "Make sure you're using the course-provided road_dataset.py."
-        )
-
-    # Try calling road_dataset.load_data with minimal parameters first;
-    # fall back to richer signatures if supported.
-    loaders = None
-    tried = []
-    for call in (
-        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers),
-        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, image_size=(96,128)),
-        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data"),
-        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data", image_size=(96,128)),
-    ):
-        try:
-            loaders = call()
-            break
-        except TypeError as e:
-            tried.append(str(e))
-            continue
-    if loaders is None:
-        raise RuntimeError("road_dataset.load_data signature mismatch. Tried variants:\n" + "\n".join(tried))
-
-    train_loader = loaders.get("train") or loaders.get("trn")
-    val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
-    if train_loader is None or val_loader is None:
-        raise RuntimeError("road_dataset.load_data() did not return expected loaders for train/val")
-
-    # --- One-batch sanity check so you immediately see labels & depth are present ---
-    try:
-        dbg = next(iter(train_loader))
-        seg_dbg = get_seg(dbg)
-        depth_dbg = get_depth(dbg)
-        seg_uni = seg_dbg.unique().tolist() if seg_dbg is not None else []
-        d_mean = float(depth_dbg.float().mean()) if depth_dbg is not None else float("nan")
-        d_std  = float(depth_dbg.float().std())  if depth_dbg is not None else float("nan")
-        print(f"[Sanity] seg classes: {seg_uni if seg_uni else 'N/A'} | depth mean {d_mean:.4f} std {d_std:.4f}")
-    except Exception as e:
-        print(f"[Sanity] Could not sample a debug batch: {e}")
-
-    model = Detector().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
-
-    # If loader provides no masks, force seg loss to 0 (depth-only)
-    have_masks = True
-    try:
-        # peek again to decide
-        have_masks = get_seg(next(iter(train_loader))) is not None and (args.w_seg > 0.0) and (not args.allow_missing_masks)
-    except Exception:
-        have_masks = not args.allow_missing_masks
-
-    effective_w_seg = args.w_seg if have_masks else 0.0
-    if have_masks and effective_w_seg <= 0.0:
-        print("[Warn] w_seg <= 0 with masks present; segmentation will not learn.")
-
-    best_iou, best_path = -float("inf"), None
-    for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, device,
-                                  w_seg=effective_w_seg, w_depth=args.w_depth, have_masks=have_masks)
-        val_iou, val_mae, val_lane_mae = evaluate(model, val_loader, device, have_masks=have_masks)
-
-        iou_str  = "N/A" if (math.isnan(val_iou)) else f"{val_iou:.4f}"
-        lane_str = "N/A" if (math.isnan(val_lane_mae)) else f"{val_lane_mae:.4f}"
-        print(f"Epoch {epoch:02d} | train loss {tr_loss:.4f} | val IoU {iou_str} | MAE {val_mae:.4f} | lane MAE {lane_str}")
-
-        score_for_sched = (val_iou if not math.isnan(val_iou) else -val_mae)
-        scheduler.step(score_for_sched)
-
-        if not math.isnan(val_iou) and val_iou > best_iou:
-            best_iou = val_iou
-            best_path = save_checkpoint(model, out_dir=args.save_dir, prefix="detector")
-            save_for_grader(model)  # writes homework/detector.th for the grader
-            print(f"  ↳ New best IoU: {best_iou:.4f}. Saved to {best_path} and homework/detector.th")
-
-    if best_path is None:
-        best_path = save_checkpoint(model, out_dir=args.save_dir, prefix="detector_final")
-        print(f"Saved final detector checkpoint to {best_path}")
-    save_for_grader(model)  # refresh homework/detector.th with final state
-    best_str = "N/A" if math.isnan(best_iou) or best_iou == -float("inf") else f"{best_iou:.4f}"
-    print(f"Best IoU {best_str} | Best path {best_path}")
+    def __len__(self) -> int:
+        return self.N
 
 
-if __name__ == "__main__":
-    main()
+class DriveDataset(Dataset):
+    """
+    Dataset across many episodes for a given split (train/val/test).
+    Each __getitem__ returns a dict with keys: image, depth, track.
+    """
+    def __init__(self, root_dir: str | Path, split: str = "train", transform_pipeline: Optional[str] = None):
+        self.root_dir = Path(root_dir)
+        self.split = split
+        self.split_dir = self.root_dir / split
+
+        if not self.split_dir.exists():
+            raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
+
+        # Gather episode directories (contain info.npz)
+        episode_dirs = sorted([p for p in self.split_dir.iterdir() if (p / "info.npz").exists()])
+
+        if not episode_dirs:
+            # sometimes episodes are nested one level deeper
+            for p in self.split_dir.rglob("info.npz"):
+                episode_dirs.append(p.parent)
+            episode_dirs = sorted(set(episode_dirs))
+
+        if not episode_dirs:
+            raise FileNotFoundError(f"No episodes found under {self.split_dir}")
+
+        self.episodes: List[DriveEpisode] = []
+        for ep in episode_dirs:
+            try:
+                self.episodes.append(DriveEpisode(ep))
+            except Exception as e:
+                # If an episode is malformed, skip with a warning
+                print(f"[DriveDataset] Warning: skipping episode {ep}: {e}")
+
+        if not self.episodes:
+            raise RuntimeError(f"All episodes under {self.split_dir} failed to load.")
+
+        # Build a global index of (ep_idx, frame_idx)
+        self.index: List[Tuple[int, int]] = []
+        for ep_idx, ep in enumerate(self.episodes):
+            for fidx in range(len(ep)):
+                self.index.append((ep_idx, fidx))
+
+        # Build transforms
+        # We apply geometric transforms consistently to image/depth/track.
+        # For simplicity, we just resize to (96,128). Optionally add train-only hflip.
+        self.do_hflip = (split == "train" and transform_pipeline in ("hflip", "flip", "strong"))
+        self.normalize = transforms.Normalize(mean=INPUT_MEAN, std=INPUT_STD)
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _load_triplet(self, ep: DriveEpisode, fidx: int) -> Tuple[Image.Image, np.ndarray, np.ndarray]:
+        # Load RGB image
+        img_path = ep.image_paths[fidx]
+        with Image.open(img_path) as im:
+            im = im.convert("RGB")
+
+        depth = ep.depth[fidx]  # (H,W) float 0..1
+        track = ep.track[fidx]  # (H,W) labels {0,1,2}
+
+        return im, depth, track
+
+    def _apply_transforms(self, im: Image.Image, depth_np: np.ndarray, track_np: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Convert depth/track to PIL for consistent geometry ops
+        # Depth is continuous -> use mode "F" (32-bit float)
+        dep_img = Image.fromarray(depth_np.astype(np.float32), mode="F")
+        # Track is categorical -> keep as L (8-bit) but will use nearest interpolation
+        trk_img = Image.fromarray(track_np.astype(np.uint8), mode="L")
+
+        # Optional horizontal flip (train only), applied consistently
+        if self.do_hflip:
+            if np.random.rand() < 0.5:
+                im = TF.hflip(im)
+                dep_img = TF.hflip(dep_img)
+                trk_img = TF.hflip(trk_img)
+
+        # Resize to target resolution
+        H, W = TARGET_HW
+        im = TF.resize(im, size=[H, W], interpolation=transforms.InterpolationMode.BILINEAR)
+        dep_img = TF.resize(dep_img, size=[H, W], interpolation=transforms.InterpolationMode.BILINEAR)
+        trk_img = TF.resize(trk_img, size=[H, W], interpolation=transforms.InterpolationMode.NEAREST)
+
+        # To tensor
+        img_t = TF.to_tensor(im)  # (3,H,W) float32 [0,1]
+        img_t = self.normalize(img_t)
+
+        # Depth back to numpy -> tensor
+        depth_t = torch.from_numpy(np.array(dep_img, dtype=np.float32))  # (H,W)
+        # Ensure depth is within [0,1] after resizing
+        depth_t.clamp_(0.0, 1.0)
+
+        # Track to tensor (long)
+        track_t = torch.from_numpy(np.array(trk_img, dtype=np.uint8)).long()  # (H,W)
+
+        return img_t, depth_t, track_t
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ep_idx, fidx = self.index[idx]
+        ep = self.episodes[ep_idx]
+        im, depth_np, track_np = self._load_triplet(ep, fidx)
+        img_t, depth_t, track_t = self._apply_transforms(im, depth_np, track_np)
+        return {"image": img_t, "depth": depth_t, "track": track_t}
+
+
+def load_data(
+    dataset_path: str | Path,
+    split: str = "train",
+    transform_pipeline: Optional[str] = None,
+    batch_size: int = 16,
+    num_workers: int = 2,
+    shuffle: bool = True,
+    return_dataloader: bool = True,
+):
+    """
+    Create a Dataset or DataLoader for the drive task.
+    Returns DataLoader by default; set return_dataloader=False to get the Dataset.
+    """
+    ds = DriveDataset(dataset_path, split=split, transform_pipeline=transform_pipeline)
+
+    if not return_dataloader:
+        return ds
+
+    # Shuffle only for train by default
+    do_shuffle = (shuffle and split == "train")
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=do_shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
