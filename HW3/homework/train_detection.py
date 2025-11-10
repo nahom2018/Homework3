@@ -2,7 +2,7 @@ import argparse, time, torch, torch.nn as nn, torch.optim as optim
 from homework.models import load_model
 
 def import_drive_loader():
-    for name in ["drive_dataset","road_dataset"]:
+    for name in ["homework.datasets.drive_dataset","homework.datasets.road_dataset"]:
         try:
             mod=__import__(name)
             if hasattr(mod,"load_data"): return mod.load_data
