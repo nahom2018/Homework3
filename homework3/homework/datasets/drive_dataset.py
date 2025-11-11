@@ -1,4 +1,4 @@
-# homework/train_detection.py
+
 import argparse, os, math
 from datetime import datetime
 
