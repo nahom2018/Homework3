@@ -22,7 +22,7 @@ except Exception:
 def _loaders(dataset_path, batch_size, num_workers, transform_pipeline="basic"):
     # Try common function names found in different starter repos
     for fname in ("load_data", "load_data_fn", "get_loaders", "load"):
-        fn = getattr(drive_ds, fname, None)
+        fn = getattr(load_data, fname, None)
         if fn is None:
             continue
         # Call with the richest signature first; fall back as needed
