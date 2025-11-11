@@ -9,11 +9,13 @@ from torch.utils.data import DataLoader  # noqa: F401
 
 
 from homework.models import Detector, save_model as save_for_grader
-
+load_data = None
 try:
-    from .datasets import drive_dataset as drive_ds
+    from .datasets import drive_dataset as load_data
 except Exception:
-    import datasets.drive_dataset as drive_ds
+    import datasets.drive_dataset as load_data
+
+# Prefer the correct loader from road_dataset
 
 
 
