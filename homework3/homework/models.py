@@ -1,5 +1,6 @@
 from pathlib import Path
 import numpy as np
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,24 +108,23 @@ class Classifier(nn.Module):
 
     @torch.inference_mode()
     def predict(self, x):
-        """
-        If x is a single image -> return int class id.
-        If x is a batch      -> return 1D tensor of class ids (CPU).
-        """
         self.eval()
-        batch = self._to_batch(x)
-
-        # normalize exactly like training
+        batch = self._to_batch(x)  # -> (B,3,H,W) in [0,1]
         device = next(self.parameters()).device
-        mean = torch.tensor(_MEAN, device=device).view(3, 1, 1)
-        std = torch.tensor(_STD, device=device).view(3, 1, 1)
+        batch = batch.to(device)
+
+        # --- ensure 64x64 for the network ---
+        if batch.shape[-2:] != (64, 64):
+            batch = F.interpolate(batch, size=(64, 64), mode="bilinear", align_corners=False)
+
+        # --- normalize exactly like training ---
+        mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(3, 1, 1)
+        std = torch.tensor((0.229, 0.224, 0.225), device=device).view(3, 1, 1)
         batch = (batch - mean) / std
 
-        logits = self(batch)                 # (B, num_classes)
+        logits = self(batch)
         preds = logits.argmax(dim=1)
-        if preds.numel() == 1:
-            return int(preds.item())
-        return preds.cpu()
+        return int(preds.item()) if preds.numel() == 1 else preds.cpu()
 
 class Detector(nn.Module):
     def __init__(self, num_classes: int = 3, in_channels: int = 3, **kwargs):
