@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,6 +68,46 @@ class Classifier(nn.Module):
         x = self.enc3(x)
         x = self.pool3(x)
         return self.head(x)
+
+    def _to_batch(self, x):
+        """Return a 4D float32 tensor (B,3,64,64) on CPU from numpy/torch input."""
+        if isinstance(x, np.ndarray):
+            arr = x
+            if arr.ndim == 3 and arr.shape[0] == 3:  # CHW
+                t = torch.from_numpy(arr).float()
+            elif arr.ndim == 3 and arr.shape[-1] == 3:  # HWC -> CHW
+                t = torch.from_numpy(arr.transpose(2, 0, 1)).float()
+            else:
+                raise ValueError(f"Unexpected numpy image shape: {arr.shape}")
+            # scale to [0,1] if looks like uint8 range
+            if t.max() > 1.0:
+                t = t / 255.0
+            t = t.unsqueeze(0)  # (1,3,H,W)
+            return t
+        elif torch.is_tensor(x):
+            t = x
+            if t.ndim == 3:  # (3,H,W) -> (1,3,H,W)
+                t = t.unsqueeze(0)
+            elif t.ndim != 4:
+                raise ValueError(f"Unexpected tensor shape: {tuple(t.shape)}")
+            return t.float()
+        else:
+            raise TypeError(f"Unsupported input type for predict: {type(x)}")
+
+    @torch.inference_mode()
+    def predict(self, x):
+        """
+        If x is a single image -> return int class id.
+        If x is a batch      -> return 1D tensor of class ids (on CPU).
+        """
+        self.eval()
+        batch = self._to_batch(x)
+        batch = batch.to(next(self.parameters()).device)
+        logits = self(batch)  # (B, num_classes)
+        preds = logits.argmax(dim=1)  # (B,)
+        if preds.numel() == 1:
+            return int(preds.item())
+        return preds.cpu()
 
 class Detector(nn.Module):
     def __init__(self, num_classes: int = 3, in_channels: int = 3, **kwargs):
