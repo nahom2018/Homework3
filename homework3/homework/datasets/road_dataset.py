@@ -1,5 +1,7 @@
 from pathlib import Path
-
+from pathlib import Path
+from typing import Dict, Union
+from torch.utils.data import DataLoader, ConcatDataset, Dataset
 import numpy as np
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
@@ -72,41 +74,93 @@ def load_data(
     num_workers: int = 2,
     batch_size: int = 32,
     shuffle: bool = False,
-) -> DataLoader | Dataset:
+) -> Union[DataLoader, Dataset, Dict[str, DataLoader]]:
     """
-    Constructs the dataset/dataloader.
-    The specified transform_pipeline must be implemented in the RoadDataset class.
+    Build datasets/dataloaders for the SuperTuxKart drive_data.
 
-    Args:
-        transform_pipeline (str): 'default', 'aug', or other custom transformation pipelines
-        return_dataloader (bool): returns either DataLoader or Dataset
-        num_workers (int): data workers, set to 0 for VSCode debugging
-        batch_size (int): batch size
-        shuffle (bool): should be true for train and false for val
+    Accepts:
+      - Root path with splits:        drive_data/
+        (expects drive_data/train/* and drive_data/val/* episodes)
+      - Single split path:            drive_data/train
+      - Single episode path:          drive_data/train/cornfield_crossing_00
 
-    Returns:
-        DataLoader or Dataset
+    If both 'train' and 'val' exist under dataset_path, returns {"train": DL, "val": DL}.
+    Otherwise returns a single DataLoader (or Dataset if return_dataloader=False).
     """
-    dataset_path = Path(dataset_path)
-    scenes = [x for x in dataset_path.iterdir() if x.is_dir()]
 
-    # can pass in a single scene like "road_data/val/cornfield_crossing_04"
-    if not scenes and dataset_path.is_dir():
-        scenes = [dataset_path]
+    root = Path(dataset_path)
 
-    datasets = []
-    for episode_path in sorted(scenes):
-        datasets.append(RoadDataset(episode_path, transform_pipeline=transform_pipeline))
-    dataset = ConcatDataset(datasets)
+    def _episodes_in_dir(split_dir: Path):
+        # Return sorted episode directories inside a split dir
+        if not split_dir.exists():
+            return []
+        return sorted([p for p in split_dir.iterdir() if p.is_dir()])
 
-    print(f"Loaded {len(dataset)} samples from {len(datasets)} episodes")
+    # Case A: dataset_path is the root containing train/ and/or val/
+    train_dir = root / "train"
+    val_dir   = root / "val"
+    has_train = train_dir.exists() and train_dir.is_dir()
+    has_val   = val_dir.exists() and val_dir.is_dir()
+
+    if has_train or has_val:
+        splits = {}
+        if has_train:
+            train_eps = _episodes_in_dir(train_dir)
+            if not train_eps:
+                raise FileNotFoundError(f"No episode directories found in {train_dir}")
+            train_list = [RoadDataset(ep, transform_pipeline=transform_pipeline) for ep in train_eps]
+            train_ds = ConcatDataset(train_list) if len(train_list) > 1 else train_list[0]
+            splits["train"] = train_ds
+
+        if has_val:
+            val_eps = _episodes_in_dir(val_dir)
+            if not val_eps:
+                raise FileNotFoundError(f"No episode directories found in {val_dir}")
+            val_list = [RoadDataset(ep, transform_pipeline=transform_pipeline) for ep in val_eps]
+            val_ds = ConcatDataset(val_list) if len(val_list) > 1 else val_list[0]
+            splits["val"] = val_ds
+
+        if not return_dataloader:
+            return splits  # dict of datasets
+
+        # Build loaders (shuffle train only)
+        loaders: Dict[str, DataLoader] = {}
+        for sp_name, ds in splits.items():
+            loaders[sp_name] = DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=(sp_name == "train"),
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=(num_workers > 0),
+            )
+        print(f"Loaded train={has_train} val={has_val} | "
+              f"train_ep={len(_episodes_in_dir(train_dir)) if has_train else 0} "
+              f"val_ep={len(_episodes_in_dir(val_dir)) if has_val else 0}")
+        return loaders
+
+    # Case B: dataset_path is a split directory (e.g., drive_data/train)
+    #         or a single episode directory (e.g., drive_data/train/cornfield_crossing_00)
+    if root.is_dir():
+        # If it contains episode subfolders, use them; otherwise treat it as a single episode
+        episode_dirs = _episodes_in_dir(root)
+        if episode_dirs:
+            ds_list = [RoadDataset(ep, transform_pipeline=transform_pipeline) for ep in episode_dirs]
+            dataset: Dataset = ConcatDataset(ds_list) if len(ds_list) > 1 else ds_list[0]
+        else:
+            # Single episode folder expected to contain info.npz and frames/
+            dataset = RoadDataset(root, transform_pipeline=transform_pipeline)
+    else:
+        raise FileNotFoundError(f"Path does not exist: {root}")
 
     if not return_dataloader:
         return dataset
 
     return DataLoader(
         dataset,
-        num_workers=num_workers,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle,                 # caller decides when not using root
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
     )
