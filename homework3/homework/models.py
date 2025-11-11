@@ -70,41 +70,59 @@ class Classifier(nn.Module):
         return self.head(x)
 
     def _to_batch(self, x):
-        """Return a 4D float32 tensor (B,3,64,64) on CPU from numpy/torch input."""
+        """
+        Convert PIL/np/tensor image -> (B,3,H,W) float32 in [0,1].
+        """
         if isinstance(x, np.ndarray):
             arr = x
-            if arr.ndim == 3 and arr.shape[0] == 3:  # CHW
+            if arr.ndim == 3 and arr.shape[0] == 3:           # CHW
                 t = torch.from_numpy(arr).float()
-            elif arr.ndim == 3 and arr.shape[-1] == 3:  # HWC -> CHW
+            elif arr.ndim == 3 and arr.shape[-1] == 3:        # HWC -> CHW
                 t = torch.from_numpy(arr.transpose(2, 0, 1)).float()
             else:
                 raise ValueError(f"Unexpected numpy image shape: {arr.shape}")
-            # scale to [0,1] if looks like uint8 range
-            if t.max() > 1.0:
+            if t.max() > 1.0:  # likely uint8 range
                 t = t / 255.0
-            t = t.unsqueeze(0)  # (1,3,H,W)
+            t = t.unsqueeze(0)
             return t
-        elif torch.is_tensor(x):
+        try:
+            # PIL Image?
+            from PIL.Image import Image as PILImage
+            if isinstance(x, PILImage):
+                t = torch.from_numpy(np.array(x)).permute(2,0,1).float() / 255.0
+                return t.unsqueeze(0)
+        except Exception:
+            pass
+        if torch.is_tensor(x):
             t = x
-            if t.ndim == 3:  # (3,H,W) -> (1,3,H,W)
+            if t.ndim == 3:
                 t = t.unsqueeze(0)
             elif t.ndim != 4:
                 raise ValueError(f"Unexpected tensor shape: {tuple(t.shape)}")
-            return t.float()
-        else:
-            raise TypeError(f"Unsupported input type for predict: {type(x)}")
+            t = t.float()
+            if t.max() > 1.0:
+                t = t / 255.0
+            return t
+        raise TypeError(f"Unsupported input type for predict: {type(x)}")
 
     @torch.inference_mode()
     def predict(self, x):
         """
         If x is a single image -> return int class id.
-        If x is a batch      -> return 1D tensor of class ids (on CPU).
+        If x is a batch      -> return 1D tensor of class ids (CPU).
         """
         self.eval()
         batch = self._to_batch(x)
-        batch = batch.to(next(self.parameters()).device)
-        logits = self(batch)  # (B, num_classes)
-        preds = logits.argmax(dim=1)  # (B,)
+
+        # normalize exactly like training
+        device = next(self.parameters()).device
+        batch = batch.to(device)
+        mean = _MEAN.to(device)
+        std  = _STD.to(device)
+        batch = (batch - mean) / std
+
+        logits = self(batch)                 # (B, num_classes)
+        preds = logits.argmax(dim=1)
         if preds.numel() == 1:
             return int(preds.item())
         return preds.cpu()
