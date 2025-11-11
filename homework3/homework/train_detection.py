@@ -193,7 +193,8 @@ def main():
 
     # road_dataset.load_data expects the dataset path as the FIRST positional arg
     # and (based on your error) doesn't accept root/image_size/require_masks.
-    loaders = load_data(args.dataset_path, batch_size=args.batch_size, num_workers=args.num_workers)
+    loaders = _loaders(args.dataset_path, args.batch_size, args.num_workers, transform_pipeline="basic")
+
 
     # Accept both dict or tuple returns
     if isinstance(loaders, dict):
