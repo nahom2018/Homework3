@@ -71,58 +71,68 @@ class Classifier(nn.Module):
         return self.head(x)
 
     def _to_batch(self, x):
-        """
-        Convert PIL/np/tensor image -> (B,3,H,W) float32 in [0,1].
-        """
+        # returns float32 in [0,1], shape (B,3,H,W) on CPU
         if isinstance(x, np.ndarray):
-            arr = x
-            if arr.ndim == 3 and arr.shape[0] == 3:           # CHW
-                t = torch.from_numpy(arr).float()
-            elif arr.ndim == 3 and arr.shape[-1] == 3:        # HWC -> CHW
-                t = torch.from_numpy(arr.transpose(2, 0, 1)).float()
+            if x.ndim == 3 and x.shape[-1] == 3:      # HWC
+                t = torch.from_numpy(x).permute(2,0,1).float()
+            elif x.ndim == 3 and x.shape[0] == 3:     # CHW
+                t = torch.from_numpy(x).float()
             else:
-                raise ValueError(f"Unexpected numpy image shape: {arr.shape}")
-            if t.max() > 1.0:  # likely uint8 range
-                t = t / 255.0
-            t = t.unsqueeze(0)
+                raise ValueError(f"Unexpected numpy shape {x.shape}")
+            if t.max() > 1.0: t = t / 255.0
+            return t.unsqueeze(0)
+        if torch.is_tensor(x):
+            t = x.float()
+            if t.ndim == 3: t = t.unsqueeze(0)
+            if t.max() > 1.0: t = t / 255.0
             return t
         try:
-            # PIL Image?
             from PIL.Image import Image as PILImage
             if isinstance(x, PILImage):
                 t = torch.from_numpy(np.array(x)).permute(2,0,1).float() / 255.0
                 return t.unsqueeze(0)
         except Exception:
             pass
-        if torch.is_tensor(x):
-            t = x
-            if t.ndim == 3:
-                t = t.unsqueeze(0)
-            elif t.ndim != 4:
-                raise ValueError(f"Unexpected tensor shape: {tuple(t.shape)}")
-            t = t.float()
-            if t.max() > 1.0:
-                t = t / 255.0
-            return t
-        raise TypeError(f"Unsupported input type for predict: {type(x)}")
+        raise TypeError(f"Unsupported input type: {type(x)}")
+
+    def _resize_short_side(self, img, short=72):
+        # img: (B,3,H,W) -> scale so min(H,W)=short, preserve aspect ratio
+        B, C, H, W = img.shape
+        if H == 0 or W == 0: return img
+        if min(H, W) == short: return img
+        if H < W:
+            newH, newW = short, int(round(W * (short / H)))
+        else:
+            newH, newW = int(round(H * (short / W))), short
+        return F.interpolate(img, size=(newH, newW), mode="bilinear", align_corners=False)
+
+    def _center_crop(self, img, size=64):
+        # img: (B,3,H,W) -> (B,3,size,size)
+        B, C, H, W = img.shape
+        if H < size or W < size:
+            # if smaller, just bilinear to exact size
+            return F.interpolate(img, size=(size, size), mode="bilinear", align_corners=False)
+        top = (H - size) // 2
+        left = (W - size) // 2
+        return img[:, :, top:top+size, left:left+size]
 
     @torch.inference_mode()
     def predict(self, x):
         self.eval()
-        batch = self._to_batch(x)  # -> (B,3,H,W) in [0,1]
+        batch = self._to_batch(x)  # (B,3,H,W) in [0,1]
         device = next(self.parameters()).device
         batch = batch.to(device)
 
-        # --- ensure 64x64 for the network ---
-        if batch.shape[-2:] != (64, 64):
-            batch = F.interpolate(batch, size=(64, 64), mode="bilinear", align_corners=False)
+        # === match validation preprocessing: Resize(72) -> CenterCrop(64) ===
+        batch = self._resize_short_side(batch, short=72)
+        batch = self._center_crop(batch, size=64)
 
-        # --- normalize exactly like training ---
-        mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(3, 1, 1)
-        std = torch.tensor((0.229, 0.224, 0.225), device=device).view(3, 1, 1)
+        # === normalize (ImageNet stats as used in your training) ===
+        mean = torch.tensor(_MEAN, device=device).view(3,1,1)
+        std  = torch.tensor(_STD,  device=device).view(3,1,1)
         batch = (batch - mean) / std
 
-        logits = self(batch)
+        logits = self(batch)                # (B,6)
         preds = logits.argmax(dim=1)
         return int(preds.item()) if preds.numel() == 1 else preds.cpu()
 
