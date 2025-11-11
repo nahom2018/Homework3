@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HOMEWORK_DIR = Path(__file__).resolve().parent
-INPUT_MEAN = [0.2788, 0.2657, 0.2629]
-INPUT_STD = [0.2064, 0.1944, 0.2252]
+_MEAN = (0.485, 0.456, 0.406)
+_STD  = (0.229, 0.224, 0.225)
 
 
 class ConvBlock(nn.Module):
@@ -116,9 +116,8 @@ class Classifier(nn.Module):
 
         # normalize exactly like training
         device = next(self.parameters()).device
-        batch = batch.to(device)
-        mean = _MEAN.to(device)
-        std  = _STD.to(device)
+        mean = torch.tensor(_MEAN, device=device).view(3, 1, 1)
+        std = torch.tensor(_STD, device=device).view(3, 1, 1)
         batch = (batch - mean) / std
 
         logits = self(batch)                 # (B, num_classes)
