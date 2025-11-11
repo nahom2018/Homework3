@@ -185,11 +185,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    if load_data is None:
-        raise RuntimeError(
-            "Could not import load_data from datasets/road_dataset.py. "
-            "Ensure the file exists and is importable."
-        )
+
 
     # road_dataset.load_data expects the dataset path as the FIRST positional arg
     # and (based on your error) doesn't accept root/image_size/require_masks.
