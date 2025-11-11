@@ -1,4 +1,4 @@
-# homework/train_detection.py
+
 import argparse, os, math
 from datetime import datetime
 
@@ -7,44 +7,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader  # noqa: F401
 
-
 from homework.models import Detector, save_model as save_for_grader
 
+# --- Use the CORRECT dataset loader (README typo) ---
+# Prefer datasets/road_dataset.py; keep fallbacks just in case.
+load_road_data = None
 try:
-    from .datasets import road_dataset as ds
+    from homework.datasets.road_dataset import load_data as load_road_data
 except Exception:
-    import datasets.road_dataset as ds
-
-# Prefer the correct loader from road_dataset
-
-
-
-def _loaders(dataset_path, batch_size, num_workers, transform_pipeline="basic"):
-    # Try common function names found in different starter repos
-    for fname in ("load_data", "load_data_fn", "get_loaders", "load"):
-        fn = getattr(ds, fname, None)
-        if fn is None:
-            continue
-        # Call with the richest signature first; fall back as needed
-        try:
-            return fn(
-                dataset_path,
-                split=None,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                return_dataloader=True,
-                transform_pipeline=transform_pipeline,
-            )
-        except TypeError:
-            try:
-                return fn(dataset_path, batch_size=batch_size, num_workers=num_workers)
-            except TypeError:
-                return fn(dataset_path)
-    raise ImportError(
-        "No loader found in drive_dataset.py. Expected one of: "
-        "load_data, load_data_fn, get_loaders, load"
-    )
-
+    try:
+        from homework.road_dataset import load_data as load_road_data
+    except Exception:
+        load_road_data = None
 
 
 def save_checkpoint(model, out_dir="logs", prefix="detector"):
@@ -57,30 +31,37 @@ def save_checkpoint(model, out_dir="logs", prefix="detector"):
 
 @torch.no_grad()
 def compute_mean_iou(preds, targets, num_classes=3):
+    """
+    preds:   (B,H,W) int
+    targets: (B,H,W) int
+    """
     iou_sum, count = 0.0, 0
     for cls in range(num_classes):
-        pc = (preds == cls)
-        tc = (targets == cls)
-        inter = (pc & tc).sum().item()
-        union = (pc | tc).sum().item()
+        pred_cls = (preds == cls)
+        tgt_cls = (targets == cls)
+        inter = (pred_cls & tgt_cls).sum().item()
+        union = (pred_cls | tgt_cls).sum().item()
         if union > 0:
             iou_sum += inter / union
             count += 1
     return (iou_sum / count) if count > 0 else float("nan")
 
 
-def _get_seg(batch):
+# ---------- Batch helpers (tolerate different key names) ----------
+def get_seg(batch):
+    # common names: "track", "seg", "mask", "labels"
     for k in ("track", "seg", "mask", "labels"):
-        if k in batch and batch[k] is not None:
+        if k in batch:
             return batch[k]
     return None
 
-
-def _get_depth(batch):
+def get_depth(batch):
+    # common names: "depth", "depths"
     for k in ("depth", "depths"):
-        if k in batch and batch[k] is not None:
+        if k in batch:
             return batch[k]
-    raise KeyError("Depth tensor not found in batch (looked for keys: depth/depths).")
+    return None
+# ------------------------------------------------------------------
 
 
 def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, have_masks=True):
@@ -90,29 +71,32 @@ def train_one_epoch(model, loader, optimizer, device, w_seg=1.0, w_depth=1.0, ha
 
     running_loss, n = 0.0, 0
     for batch in loader:
-        x = batch["image"].to(device, non_blocking=True)             # (B,3,H,W)
-        y_depth = _get_depth(batch).to(device, non_blocking=True).float()  # (B,H,W)
-
-        y_seg = _get_seg(batch)
-        if have_masks and y_seg is not None:
-            y_seg = y_seg.to(device, non_blocking=True).long()
+        x = batch["image"].to(device, non_blocking=True)          # (B,3,H,W)
+        y_seg = get_seg(batch)
+        y_depth = get_depth(batch).to(device, non_blocking=True).float()  # (B,H,W)
 
         optimizer.zero_grad(set_to_none=True)
-        seg_logits, depth = model(x)                                  # seg:(B,3,H,W), depth:(B,1,H,W)
+        seg_logits, depth = model(x)                              # seg:(B,3,H,W), depth:(B,1,H,W)
 
+        # Depth loss (required)
         loss_depth = l1(depth, y_depth.unsqueeze(1)) * w_depth
-        loss_seg = ce(seg_logits, y_seg) * w_seg if (have_masks and y_seg is not None and w_seg > 0.0) \
-                   else torch.zeros((), device=device)
+
+        # Seg loss only if masks exist and weight > 0
+        if have_masks and (y_seg is not None) and w_seg > 0.0:
+            y_seg = y_seg.to(device, non_blocking=True).long()
+            loss_seg = ce(seg_logits, y_seg) * w_seg
+        else:
+            loss_seg = torch.zeros((), device=device)
 
         loss = loss_seg + loss_depth
         loss.backward()
         optimizer.step()
 
         bs = x.size(0)
-        running_loss += float(loss.item()) * bs
+        running_loss += loss.item() * bs
         n += bs
 
-    return running_loss / max(n, 1)
+    return running_loss / n
 
 
 @torch.no_grad()
@@ -127,18 +111,16 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
 
     for batch in loader:
         x = batch["image"].to(device, non_blocking=True)
-        y_depth = _get_depth(batch).to(device, non_blocking=True).float()
-
-        y_seg = _get_seg(batch)
-        if have_masks and y_seg is not None:
-            y_seg = y_seg.to(device, non_blocking=True).long()
+        y_seg = get_seg(batch)
+        y_depth = get_depth(batch).to(device, non_blocking=True).float()
 
         seg_logits, depth = model(x)
 
         mae_all = l1(depth, y_depth.unsqueeze(1)).item()
         total_mae += mae_all * x.size(0)
 
-        if have_masks and y_seg is not None:
+        if have_masks and (y_seg is not None):
+            y_seg = y_seg.to(device, non_blocking=True).long()
             preds = seg_logits.argmax(dim=1)  # (B,H,W)
             miou = compute_mean_iou(preds, y_seg, num_classes=num_classes)
             if not math.isnan(miou):
@@ -169,7 +151,6 @@ def evaluate(model, loader, device, num_classes=3, have_masks=True):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset_path", type=str, default="drive_data", help="Path that contains train/ and val/ dirs")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -179,60 +160,69 @@ def main():
     p.add_argument("--w_depth", type=float, default=1.0)
     p.add_argument("--save_dir", type=str, default="logs")
     p.add_argument("--allow_missing_masks", action="store_true",
-                   help="Force depth-only even if masks are present.")
+                   help="Depth-only mode if loader doesn't supply segmentation labels.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    if load_data is None:
+    if load_road_data is None:
         raise RuntimeError(
             "Could not import load_data from datasets/road_dataset.py. "
-            "Ensure the file exists and is importable."
+            "Make sure you're using the course-provided road_dataset.py."
         )
 
-    # road_dataset.load_data expects the dataset path as the FIRST positional arg
-    # and (based on your error) doesn't accept root/image_size/require_masks.
-    loaders = _loaders(args.dataset_path, args.batch_size, args.num_workers, transform_pipeline="basic")
+    # Try calling road_dataset.load_data with minimal parameters first;
+    # fall back to richer signatures if supported.
+    loaders = None
+    tried = []
+    for call in (
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers),
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, image_size=(96,128)),
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data"),
+        lambda: load_road_data(batch_size=args.batch_size, num_workers=args.num_workers, root="drive_data", image_size=(96,128)),
+    ):
+        try:
+            loaders = call()
+            break
+        except TypeError as e:
+            tried.append(str(e))
+            continue
+    if loaders is None:
+        raise RuntimeError("road_dataset.load_data signature mismatch. Tried variants:\n" + "\n".join(tried))
 
-
-    # Accept both dict or tuple returns
-    if isinstance(loaders, dict):
-        train_loader = loaders.get("train") or loaders.get("trn")
-        val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
-    elif isinstance(loaders, (list, tuple)) and len(loaders) >= 2:
-        train_loader, val_loader = loaders[0], loaders[1]
-    else:
-        raise RuntimeError("road_dataset.load_data() returned an unexpected type. Expect dict with train/val or (train_loader, val_loader).")
-
+    train_loader = loaders.get("train") or loaders.get("trn")
+    val_loader = loaders.get("val") or loaders.get("valid") or loaders.get("test")
     if train_loader is None or val_loader is None:
-        raise RuntimeError("road_dataset.load_data() did not provide both train and val loaders.")
+        raise RuntimeError("road_dataset.load_data() did not return expected loaders for train/val")
 
-    # Peek one batch to decide if masks exist; allow override with --allow_missing_masks
+    # --- One-batch sanity check so you immediately see labels & depth are present ---
     try:
         dbg = next(iter(train_loader))
-        seg_dbg = _get_seg(dbg)
-        depth_dbg = _get_depth(dbg)
-        have_masks_detected = (seg_dbg is not None)
-        have_masks = have_masks_detected and (not args.allow_missing_masks)
-
+        seg_dbg = get_seg(dbg)
+        depth_dbg = get_depth(dbg)
         seg_uni = seg_dbg.unique().tolist() if seg_dbg is not None else []
         d_mean = float(depth_dbg.float().mean()) if depth_dbg is not None else float("nan")
         d_std  = float(depth_dbg.float().std())  if depth_dbg is not None else float("nan")
         print(f"[Sanity] seg classes: {seg_uni if seg_uni else 'N/A'} | depth mean {d_mean:.4f} std {d_std:.4f}")
-        if have_masks and set(seg_uni) == {0}:
-            print("[Warn] Masks appear to be all background; IoU will be low. Verify labels.")
     except Exception as e:
         print(f"[Sanity] Could not sample a debug batch: {e}")
-        have_masks = not args.allow_missing_masks  # conservative default
-
-    effective_w_seg = args.w_seg if have_masks else 0.0
-    if have_masks and effective_w_seg <= 0.0:
-        print("[Warn] w_seg <= 0 with masks present; segmentation will not learn.")
 
     model = Detector().to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+
+    # If loader provides no masks, force seg loss to 0 (depth-only)
+    have_masks = True
+    try:
+        # peek again to decide
+        have_masks = get_seg(next(iter(train_loader))) is not None and (args.w_seg > 0.0) and (not args.allow_missing_masks)
+    except Exception:
+        have_masks = not args.allow_missing_masks
+
+    effective_w_seg = args.w_seg if have_masks else 0.0
+    if have_masks and effective_w_seg <= 0.0:
+        print("[Warn] w_seg <= 0 with masks present; segmentation will not learn.")
 
     best_iou, best_path = -float("inf"), None
     for epoch in range(1, args.epochs + 1):
