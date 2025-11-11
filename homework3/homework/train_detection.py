@@ -12,13 +12,40 @@ from homework.models import Detector, save_model as save_for_grader
 
 # Prefer the correct loader from road_dataset
 load_data = None
+# ---- replace the old import with this ----
 try:
-    from homework.datasets.classification_dataset import load_data as load_data
+    from .datasets import drive_dataset as drive_ds
 except Exception:
+    import datasets.drive_dataset as drive_ds  # script mode fallback
+
+def _resolve_loaders(dataset_path, batch_size, num_workers, transform_pipeline="basic"):
+    # Try common function names, use the first one that exists
+    for fname in ("load_data", "load_data_fn", "get_loaders", "load"):
+        fn = getattr(drive_ds, fname, None)
+        if fn:
+            break
+    else:
+        raise ImportError(
+            "drive_dataset.py must expose one of: load_data, load_data_fn, get_loaders, load"
+        )
+
+    # Call with the most complete signature first; fall back if needed
     try:
-        from homework.road_dataset import load_data as load_data
-    except Exception:
-        load_data = None
+        return fn(
+            dataset_path,
+            split=None,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            return_dataloader=True,
+            transform_pipeline="basic",
+        )
+    except TypeError:
+        # Older / different signatures
+        try:
+            return fn(dataset_path, batch_size=batch_size, num_workers=num_workers)
+        except TypeError:
+            return fn(dataset_path)
+
 
 
 def save_checkpoint(model, out_dir="logs", prefix="detector"):
@@ -167,7 +194,8 @@ def main():
 
     # road_dataset.load_data expects the dataset path as the FIRST positional arg
     # and (based on your error) doesn't accept root/image_size/require_masks.
-    loaders = load_data(args.dataset_path, batch_size=args.batch_size, num_workers=args.num_workers)
+    loaders = _resolve_loaders(args.dataset_path, args.batch_size, args.num_workers, "basic")
+
 
     # Accept both dict or tuple returns
     if isinstance(loaders, dict):
