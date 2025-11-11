@@ -1,7 +1,7 @@
 import csv
 from pathlib import Path
 from torchvision import transforms
-
+from torchvision import transforms as T
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -30,27 +30,27 @@ class SuperTuxDataset(Dataset):
 
                     self.data.append((img_path, label_id))
 
-    def get_transform(self, transform_pipeline: str = "default"):
-        
-        xform = None
+    MEAN = (0.485, 0.456, 0.406)
+    STD = (0.229, 0.224, 0.225)
 
-        if transform_pipeline == "default":
-            xform = transforms.ToTensor()
-        elif transform_pipeline == "aug":
-            xform = transforms.Compose(
-                [
-                    transforms.RandomResizedCrop(64, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
-                    transforms.RandomHorizontalFlip(p=0.5),
-                    transforms.RandomRotation(degrees=10),
-                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
-                    transforms.ToTensor(),
-                ]
-            )
-
-        if xform is None:
-            raise ValueError(f"Invalid transform {transform_pipeline} specified!")
-
-        return xform
+    def get_transform(pipeline: str):
+        pipeline = (pipeline or "basic").lower()
+        if pipeline in ("train", "aug", "strong"):
+            return T.Compose([
+                T.ToPILImage(),
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomCrop(64, padding=4),
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+                T.ToTensor(),
+                T.Normalize(MEAN, STD),
+                T.RandomErasing(p=0.25, scale=(0.02, 0.08), value="random"),
+            ])
+        # val / test
+        return T.Compose([
+            T.ToPILImage(),
+            T.ToTensor(),
+            T.Normalize(MEAN, STD),
+        ])
 
 
     def __len__(self):

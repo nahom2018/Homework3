@@ -37,64 +37,37 @@ class UpBlock(nn.Module):
 
 
 class Classifier(nn.Module):
-    def __init__(self, num_classes: int = 6, in_channels: int = 3, **kwargs):
+    def __init__(self, num_classes=6):
         super().__init__()
-        # Use dataset stats
-        self.register_buffer("input_mean", torch.tensor(INPUT_MEAN).view(1, 3, 1, 1))
-        self.register_buffer("input_std", torch.tensor(INPUT_STD).view(1, 3, 1, 1))
-
-        self.stem = nn.Sequential(
-            ConvBlock(in_channels, 32),
-            ConvBlock(32, 32),
-            nn.MaxPool2d(2),
-            ConvBlock(32, 64),
-            ConvBlock(64, 64),
-            nn.MaxPool2d(2),
-            ConvBlock(64, 128),
-            ConvBlock(128, 128),
-            nn.MaxPool2d(2),
+        def block(in_ch, out_ch):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+        self.stem = block(3, 32)          # 64x64 -> 64x64
+        self.pool1 = nn.MaxPool2d(2)      # -> 32x32
+        self.enc2 = block(32, 64)
+        self.pool2 = nn.MaxPool2d(2)      # -> 16x16
+        self.enc3 = block(64, 128)
+        self.pool3 = nn.AdaptiveAvgPool2d(1)  # -> 1x1
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes),
         )
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(p=0.3)
-        self.fc = nn.Linear(128, num_classes)
-        self._init_weights()
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        # Conditionally normalize if inputs look like raw ToTensor() in [0, 1]
-        # This avoids double-normalizing if the grader already normalized upstream.
-        x_min = float(x.min().detach())
-        x_max = float(x.max().detach())
-        if 0.0 <= x_min and x_max <= 1.0:
-            x = (x - self.input_mean) / self.input_std
-
+    def forward(self, x):                 # (B,3,64,64)
         x = self.stem(x)
-        x = self.gap(x)
-        x = torch.flatten(x, 1)
-        x = self.dropout(x)
-        logits = self.fc(x)
-        return logits
-
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """Return class indices (B,), as expected by the grader."""
-        self.eval()
-        with torch.no_grad():
-            logits = self.forward(x)              # (B, 6)
-            preds = logits.argmax(dim=1)          # (B,)
-            return preds
-
+        x = self.pool1(x)
+        x = self.enc2(x)
+        x = self.pool2(x)
+        x = self.enc3(x)
+        x = self.pool3(x)
+        return self.head(x)
 
 class Detector(nn.Module):
     def __init__(self, num_classes: int = 3, in_channels: int = 3, **kwargs):
