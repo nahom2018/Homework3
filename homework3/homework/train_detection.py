@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader  # noqa: F401
+from .datasets.drive_dataset import load_data
 
 from homework.models import Detector, save_model as save_for_grader
 
