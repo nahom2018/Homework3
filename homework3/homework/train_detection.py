@@ -15,15 +15,7 @@ try:
 except Exception:
     import datasets.drive_dataset as drive_ds
 
-# Prefer the correct loader from road_dataset
-load_data = None
-try:
-    from homework.datasets.classification_dataset import load_data as load_data
-except Exception:
-    try:
-        from homework.road_dataset import load_data as load_data
-    except Exception:
-        load_data = None
+
 
 def _loaders(dataset_path, batch_size, num_workers, transform_pipeline="basic"):
     # Try common function names found in different starter repos
